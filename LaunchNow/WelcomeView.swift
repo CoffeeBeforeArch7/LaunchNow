@@ -8,7 +8,6 @@
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
-import SwiftData
 
 struct WelcomeView: View {
     @ObservedObject var appStore: AppStore

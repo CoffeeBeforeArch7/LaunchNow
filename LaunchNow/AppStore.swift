@@ -1,7 +1,6 @@
 import Foundation
 import AppKit
 import Combine
-import SwiftData
 import UniformTypeIdentifiers
 import SwiftUI
 
@@ -12,6 +11,8 @@ final class AppStore: ObservableObject {
     @Published var items: [LaunchpadItem] = []
     @Published private(set) var filteredItems: [LaunchpadItem] = []
     @Published var isSetting = false
+    /// 正在弹确认框（比如移到废纸篓）：这时窗口会失去焦点，不能自动收起
+    var isPresentingAlert = false
     @Published var currentPage = 0
     @Published var searchText: String = ""
     @Published var isFullscreenMode: Bool = false {
@@ -33,7 +34,7 @@ final class AppStore: ObservableObject {
         }
     }
     
-    @Published var iconScale: Double = 0.8 {
+    @Published var iconScale: Double = 1.0 {
         didSet {
             UserDefaults.standard.set(iconScale, forKey: "iconScale")
             triggerGridRefresh()
@@ -294,7 +295,7 @@ final class AppStore: ObservableObject {
         if let savedIconScale, savedIconScale > 0 {
             self.iconScale = savedIconScale
         } else {
-            self.iconScale = 0.8
+            self.iconScale = 1.0
         }
         self.showAppNameBelowIcon = UserDefaults.standard.object(forKey: "showAppNameBelowIcon") as? Bool ?? true
         self.isGlobalPinchEnabled = UserDefaults.standard.bool(forKey: "isGlobalPinchEnabled")

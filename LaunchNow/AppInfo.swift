@@ -9,6 +9,11 @@ struct AppInfo: Identifiable, Equatable, Hashable {
     // 使用应用路径作为稳定唯一标识
     var id: String { url.path }
 
+    /// 显示用的图标：扫描时拿到的图标偶尔是空的，就现取一次系统图标
+    var displayIcon: NSImage {
+        icon.size.width > 0 && icon.size.height > 0 ? icon : NSWorkspace.shared.icon(forFile: url.path)
+    }
+
     static func == (lhs: AppInfo, rhs: AppInfo) -> Bool {
         lhs.url == rhs.url
     }

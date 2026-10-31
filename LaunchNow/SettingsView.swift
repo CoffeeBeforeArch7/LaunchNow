@@ -1,7 +1,6 @@
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
-import SwiftData
 
 struct SettingsView: View {
     @ObservedObject var appStore: AppStore
@@ -10,6 +9,7 @@ struct SettingsView: View {
     @State private var hideAppSearchText: String = ""
     @State private var showAddHiddenApps: Bool = false
     @State private var pendingHiddenSelections: Set<String> = []
+    @State private var appIconChoice = AppIconChoice.current
 
     var body: some View {
         let hidableApps = appStore.hidableApps(searchText: hideAppSearchText)
@@ -94,18 +94,41 @@ struct SettingsView: View {
                         }
                     }
                     Button {
-                        appStore.iconScale = 0.8
+                        appStore.iconScale = 1.0
                     } label: {
                         Text(NSLocalizedString("DefaultSize", comment: "Default size"))
+                    }
+                }
+                HStack {
+                    Text("App 图标")
+                    Spacer()
+                    ForEach(AppIconChoice.allCases) { choice in
+                        Button {
+                            appIconChoice = choice
+                            choice.apply()
+                            appStore.refresh() // 网格里 LaunchNow 自己的图标也跟着换
+                        } label: {
+                            VStack(spacing: 4) {
+                                Image(nsImage: choice.preview)
+                                    .resizable()
+                                    .frame(width: 44, height: 44)
+                                Text(choice.title)
+                                    .font(.caption)
+                            }
+                            .padding(6)
+                            .background(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .stroke(appIconChoice == choice ? Color.accentColor : .clear, lineWidth: 2)
+                            )
+                        }
+                        .buttonStyle(.plain)
                     }
                 }
                 HStack {
                     Text(NSLocalizedString("DisplayedLanguage", comment: "Displayed Language"))
                     Spacer()
                     Button {
-                        AppDelegate.shared?.requestHideWindow {
-                            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Localization")!)
-                        }
+                        AppDelegate.shared?.hideAndOpen(URL(string: "x-apple.systempreferences:com.apple.Localization")!)
                     } label: {
                         Text(NSLocalizedString("Language", comment: "Language..."))
                     }
@@ -380,9 +403,7 @@ struct SettingsView: View {
                 .alert(updater.alertTitle, isPresented: $updater.showAlert) {
                     if let url = updater.alertURL {
                         Button(NSLocalizedString("Confirm", comment: "Confirm")) {
-                            AppDelegate.shared?.requestHideWindow {
-                                NSWorkspace.shared.open(url)
-                            }
+                            AppDelegate.shared?.hideAndOpen(url)
                         }
                         Button(NSLocalizedString("Cancel", comment: "Cancel"), role: .cancel) {}
                     } else {
@@ -526,13 +547,11 @@ struct SettingsView: View {
 
     private func isValidExportFolder(_ folder: URL) -> Bool {
         let fm = FileManager.default
-        let storeURL = folder.appendingPathComponent("Data.store")
+        let storeURL = folder.appendingPathComponent(ModelContext.fileName)
         guard fm.fileExists(atPath: storeURL.path) else { return false }
-        // 尝试打开该库并检查是否有排序数据
+        // 尝试读取该布局文件并检查是否有排序数据
         do {
-            let config = ModelConfiguration(url: storeURL)
-            let container = try ModelContainer(for: TopItemData.self, PageEntryData.self, configurations: config)
-            let ctx = container.mainContext
+            let ctx = ModelContext(url: storeURL)
             let pageEntries = try ctx.fetch(FetchDescriptor<PageEntryData>())
             if !pageEntries.isEmpty { return true }
             let legacyEntries = try ctx.fetch(FetchDescriptor<TopItemData>())

@@ -27,7 +27,7 @@
 "CheckUpdates" = "检查更新";
 
 //LaunchpadView
-"Search" = "搜索";
+"Search" = "搜索应用";
 "NoAppsFound" = "未找到应用";
 
 //FolderView
@@ -78,3 +78,13 @@
 "Gesture" = "四指触控板手势";
 "MaterialOpacity" = "材质透明度";
 
+
+/* 右键菜单：在访达中显示 / 隐藏 / 移到废纸篓 */
+"ShowInFinder" = "在访达中显示";
+"HideFromLaunchNow" = "从 LaunchNow 中隐藏";
+"MoveToTrashEllipsis" = "移到废纸篓…";
+"MoveToTrash" = "移到废纸篓";
+"MoveToTrashConfirmTitle" = "把「%@」移到废纸篓？";
+"MoveToTrashConfirmMessage" = "App 会被移到废纸篓，需要时可以从废纸篓放回。";
+"MoveToTrashFailedTitle" = "没能把「%@」移到废纸篓";
+"MoveToTrashFailedMessage" = "这个 App 可能是用安装包安装的，需要管理员权限才能删除。可以在访达里把它拖到废纸篓，系统会让你输入密码。";

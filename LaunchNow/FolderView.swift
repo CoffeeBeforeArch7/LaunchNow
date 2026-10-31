@@ -218,14 +218,15 @@ struct FolderView: View {
             computeColumnWidth(containerWidth: geo.size.width, columns: desiredColumns),
             computeAppHeight(containerHeight: geo.size.height, columns: desiredColumns)
         ) * 0.75
-        let iconSize: CGFloat = preferredIconSize ?? (computedIconBase * CGFloat(max(0.4, min(appStore.iconScale, 1.6))))
+        // 取整到整点，图标按像素画好后不用再缩放（见 CrispIcon）
+        let iconSize: CGFloat = (preferredIconSize ?? (computedIconBase * CGFloat(max(0.4, min(appStore.iconScale, 1.6))))).rounded(.down)
         // 使用自适应列数重新计算尺寸
         let recomputedColumnWidth = computeColumnWidth(containerWidth: geo.size.width, columns: desiredColumns)
         let recomputedAppHeight = computeAppHeight(containerHeight: geo.size.height, columns: desiredColumns)
         // 保障单元格至少能容纳传入的图标尺寸与标签区域
         let columnWidth = max(recomputedColumnWidth, iconSize)
         let appHeight = max(recomputedAppHeight, iconSize + 32)
-        let labelWidth: CGFloat = columnWidth * 0.9
+        let labelWidth: CGFloat = columnWidth
         let slots = visualAppSlots
 
         ZStack(alignment: .topLeading) {
@@ -398,6 +399,9 @@ extension FolderView {
         .frame(height: appHeight)
         // 保持稳定的视图身份，避免在文件夹更新后中断拖拽手势
         .id(app.id)
+        .contextMenu {
+            AppContextMenuItems(app: app, appStore: appStore)
+        }
 
         withMatchedGeometry(base, id: app.id)
             // 淡入新放置的图标

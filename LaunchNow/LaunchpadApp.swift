@@ -1,8 +1,9 @@
 import SwiftUI
 import AppKit
-import SwiftData
 import Combine
+import CoreServices
 import QuartzCore
+import ServiceManagement
 
 extension Notification.Name {
     static let launchpadWindowShown = Notification.Name("LaunchpadWindowShown")
@@ -42,7 +43,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private var window: NSWindow?
-    private let minimumContentSize = NSSize(width: 800, height: 600)
+    private let minimumContentSize = NSSize(width: 700, height: 600)
+    /// 窗口宽高比 7:6：7 列 5 行、带名字的网格正好是这个比例，图标能放大又不挤
+    private static let windowAspect: CGFloat = 7.0 / 6.0
+    /// 打开时铺在下面、盖住其它窗口的模糊墙纸
+    private let backdrop = DesktopBackdrop()
+    /// 打开前在用的 App：收起时把焦点还给它（不然焦点留在没有窗口的 LaunchNow 上，按键没反应）
+    private var previousApp: NSRunningApplication?
+    /// 打开别的 App 时不还焦点，交给新打开的那个
+    private var refocusPreviousOnHide = true
     private var lastShowAt: Date?
     private var cancellables = Set<AnyCancellable>()
     private var gesturePreviewMode: GesturePreviewMode?
@@ -86,23 +95,105 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let previewSmoothingFactor: CGFloat = 0.42
     
     let appStore = AppStore()
-    var modelContainer: ModelContainer?
+    var modelContext: ModelContext?
     
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 先套用自选图标，再扫描 App：重新安装会冲掉自选图标，晚了的话缓存里存的是默认的火箭
+        AppIconChoice.reapplyIfCustom()
         Self.shared = self
-        
+
+        migrateWindowLayoutIfNeeded()
         setupWindow()
+        // 点遮罩（面板以外）收起；和失去焦点自动收起同样的条件：设置、确认框开着时不收
+        backdrop.onClick = { [weak self] in self?.autoHideIfNeeded() }
+        backdrop.prepare()
+        // 换了桌面（各桌面墙纸可以不同）就提前把那张墙纸处理好
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.backdrop.prepare()
+        }
         bindGestureSettings()
         appStore.performInitialScanIfNeeded()
         appStore.startAutoRescan()
-        requestShowWindow()
-        
+        // 开机自启时静默待命，只有手动打开时才显示
+        if !launchedAsLoginItem {
+            requestShowWindow()
+        }
+        GlobalHotKey.shared.register { [weak self] in self?.toggleWindow() }
+        registerLoginItemOnce()
+
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(handleScreenParametersDidChange),
             name: NSApplication.didChangeScreenParametersNotification,
             object: nil
         )
+    }
+
+    /// 第 2 版布局：窗口按屏幕变大、改成 7:6，图标随之变大。旧版存的窗口尺寸和图标缩放作废一次
+    private func migrateWindowLayoutIfNeeded() {
+        let key = "windowLayoutVersion"
+        guard UserDefaults.standard.integer(forKey: key) < 2 else { return }
+        savedWindowFrame = nil
+        appStore.iconScale = 1.0
+        UserDefaults.standard.set(2, forKey: key)
+    }
+
+    /// 收起并打开 App（或系统设置等网址）：焦点交给新打开的那个，不切回之前的 App
+    func hideAndOpen(_ url: URL) {
+        refocusPreviousOnHide = false
+        requestHideWindow {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// 打开前调用：记下当前在用的 App
+    private func rememberFrontmostApp() {
+        guard let front = NSWorkspace.shared.frontmostApplication,
+              front.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
+        previousApp = front
+    }
+
+    /// 窗口收起后：撤掉遮罩；按 Esc / ⌘空格 / 点遮罩收起时把焦点还给之前的 App
+    /// （点了别的 App 或打开了 App 的，焦点已经在那边，不用还）
+    private func didHideWindow() {
+        backdrop.hide(fadeDuration: 0)
+        if refocusPreviousOnHide, NSApp.isActive, let previousApp, !previousApp.isTerminated {
+            previousApp.activate(options: [])
+        }
+        previousApp = nil
+        refocusPreviousOnHide = true
+    }
+
+    /// ⌘空格：显示或隐藏启动台
+    func toggleWindow() {
+        if window?.isVisible == true {
+            requestHideWindow()
+        } else {
+            requestShowWindow()
+        }
+    }
+
+    /// 是否由登录项拉起（开机自启）
+    private var launchedAsLoginItem: Bool {
+        guard let event = NSAppleEventManager.shared().currentAppleEvent,
+              event.eventID == AEEventID(kAEOpenApplication) else { return false }
+        return event.paramDescriptor(forKeyword: AEKeyword(keyAEPropData))?.enumCodeValue
+            == OSType(keyAELaunchedAsLogInItem)
+    }
+
+    /// 装进「应用程序」后首次运行时注册开机自启；之后尊重用户在系统设置里的开关
+    private func registerLoginItemOnce() {
+        let key = "didRegisterLoginItem"
+        guard !UserDefaults.standard.bool(forKey: key),
+              Bundle.main.bundlePath.hasPrefix("/Applications/") else { return }
+        do {
+            try SMAppService.mainApp.register()
+            UserDefaults.standard.set(true, forKey: key)
+        } catch {
+            NSLog("LaunchNow: login item registration failed: \(error)")
+        }
     }
 
     private func bindGestureSettings() {
@@ -164,35 +255,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window?.isOpaque = true
         window?.backgroundColor = .clear
         window?.hasShadow = true
-        window?.contentAspectRatio = NSSize(width: 4, height: 3)
+        window?.contentAspectRatio = NSSize(width: 7, height: 6)
         window?.contentMinSize = minimumContentSize
         window?.minSize = window?.frameRect(forContentRect: NSRect(origin: .zero, size: minimumContentSize)).size ?? minimumContentSize
         
-        // SwiftData 支持（固定到 Application Support 目录，避免替换应用后数据丢失）
-        do {
-            let fm = FileManager.default
-            let appSupport = try fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-            let storeDir = appSupport.appendingPathComponent("LaunchNow", isDirectory: true)
-            if !fm.fileExists(atPath: storeDir.path) {
-                try fm.createDirectory(at: storeDir, withIntermediateDirectories: true)
-            }
-            let storeURL = storeDir.appendingPathComponent("Data.store")
-
-            let configuration = ModelConfiguration(url: storeURL)
-            let container = try ModelContainer(for: TopItemData.self, PageEntryData.self, configurations: configuration)
-            modelContainer = container
-            appStore.configure(modelContext: container.mainContext)
-            window?.contentView = NSHostingView(rootView: LaunchpadView(appStore: appStore).modelContainer(container))
-        } catch {
-            // 回退到默认容器，保证功能可用
-            if let container = try? ModelContainer(for: TopItemData.self, PageEntryData.self) {
-                modelContainer = container
-                appStore.configure(modelContext: container.mainContext)
-                window?.contentView = NSHostingView(rootView: LaunchpadView(appStore: appStore).modelContainer(container))
-            } else {
-                window?.contentView = NSHostingView(rootView: LaunchpadView(appStore: appStore))
-            }
+        // 布局持久化（JSON，固定到 Application Support 目录，避免替换应用后数据丢失）
+        if let appSupport = try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true) {
+            let storeURL = appSupport
+                .appendingPathComponent("LaunchNow", isDirectory: true)
+                .appendingPathComponent(ModelContext.fileName)
+            let context = ModelContext(url: storeURL)
+            modelContext = context
+            appStore.configure(modelContext: context)
         }
+        window?.contentView = NSHostingView(rootView: LaunchpadView(appStore: appStore))
         
         applyCornerRadius()
         applyPreviewVisual(scale: 1, alpha: 1)
@@ -227,6 +303,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.makeKeyAndOrderFront(nil)
         window.collectionBehavior = [.transient, .canJoinAllApplications, .fullScreenAuxiliary, .ignoresCycle]
         window.orderFrontRegardless()
+        // 手势打开不经过 performShowTransition，在这里补上
+        backdrop.show(below: window, fadeDuration: 0)
     }
 
     func requestShowWindow(completion: (() -> Void)? = nil) {
@@ -248,6 +326,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         resetGesturePreviewState()
         window?.orderOut(nil)
+        didHideWindow()
         applyPreviewVisual(scale: 1, alpha: 1)
         window?.alphaValue = 1
         appStore.isSetting = false
@@ -290,6 +369,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func performShowTransition(window: NSWindow, completion: (() -> Void)? = nil) {
         isAnimatingWindowTransition = true
         resetGesturePreviewState()
+        refocusPreviousOnHide = true
+        rememberFrontmostApp()
 
         let targetRect = targetRectForCurrentScreen()
 
@@ -300,6 +381,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.collectionBehavior = [.transient, .canJoinAllApplications, .fullScreenAuxiliary, .ignoresCycle]
         window.orderFrontRegardless()
         NotificationCenter.default.post(name: .launchpadFocusSearchField, object: nil)
+        // 桌面上只留 LaunchNow：下面铺一层模糊墙纸盖住其它窗口，和面板一起淡入
+        backdrop.show(below: window, fadeDuration: 0.15)
 
         if appStore.isFullscreenMode {
             gesturePreviewTargetRect = targetRect
@@ -333,6 +416,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func performHideTransition(window: NSWindow, completion: (() -> Void)? = nil) {
         isAnimatingWindowTransition = true
         resetGesturePreviewState()
+        // 遮罩和面板一起淡出
+        backdrop.hide(fadeDuration: appStore.isFullscreenMode ? 0.2 : 0.15)
 
         let targetRect = targetRectForCurrentScreen()
 
@@ -374,7 +459,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let screen = getCurrentActiveScreen() ?? NSScreen.main!
         window.setFrame(isFullscreen ? screen.frame : calculateContentRect(for: screen), display: true)
         window.hasShadow = !isFullscreen
-        window.contentAspectRatio = isFullscreen ? NSSize(width: 0, height: 0) : NSSize(width: 4, height: 3)
+        window.contentAspectRatio = isFullscreen ? NSSize(width: 0, height: 0) : NSSize(width: 7, height: 6)
         // 切换模式时更新 styleMask：非全屏模式下允许边缘拖拽调整大小
         let newStyleMask: NSWindow.StyleMask = isFullscreen
             ? [.borderless, .fullSizeContentView]
@@ -431,6 +516,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard gesturePreviewActivated else { return }
             if !window.isVisible {
                 gesturePreviewMadeVisible = true
+                rememberFrontmostApp()
+                backdrop.show(below: window, fadeDuration: 0.15)
                 window.setFrame(targetRect, display: true)
                 applyCornerRadius()
                 applyPreviewVisual(scale: previewScale(for: smoothedProgress), alpha: previewAlpha(for: smoothedProgress))
@@ -479,6 +566,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case .showing:
             rollbackToHidden(window: window)
         case .hiding where shouldCompleteCurrentGesture():
+            backdrop.hide(fadeDuration: 0.2)
             animatePreviewVisual(toScale: previewScale(for: 0), alpha: previewAlpha(for: 0)) {
                 self.finalizeHiddenState()
             }
@@ -498,6 +586,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             applyPreviewVisual(scale: 1, alpha: 1)
             if gesturePreviewMadeVisible {
                 window.orderOut(nil)
+                didHideWindow()
             }
         }
         resetGesturePreviewState()
@@ -585,6 +674,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         animatePreviewVisual(toScale: previewScale(for: 0), alpha: previewAlpha(for: 0)) {
             window.orderOut(nil)
+            self.didHideWindow()
             self.applyPreviewVisual(scale: 1, alpha: 1)
             window.alphaValue = 1
         }
@@ -711,20 +801,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     
     private func calculateContentRect(for screen: NSScreen) -> NSRect {
-        let visibleFrame = screen.visibleFrame
-        let frame = screen.frame
-        let width = max(visibleFrame.width * 0.4, minimumContentSize.width, minimumContentSize.height * 4/3)
-        let height = width * 3/4
-        return NSRect(x: frame.midX - width/2, y: frame.midY - height/2, width: width, height: height)
+        centeredRect(for: screen, savedFrame: nil)
     }
-    
-    /// 保留保存的窗口尺寸，在当前屏幕上居中显示
+
+    /// 默认窗口：高约占可用高度的 84%（最高 880pt），宽按 7:6（1920×1080 的屏上约 980×840）
+    private func defaultWindowSize(for screen: NSScreen) -> NSSize {
+        let visibleFrame = screen.visibleFrame
+        var height = min(visibleFrame.height * 0.84, 880)
+        if height * Self.windowAspect > visibleFrame.width * 0.9 {
+            height = visibleFrame.width * 0.9 / Self.windowAspect
+        }
+        height = max(height, minimumContentSize.height).rounded()
+        return NSSize(width: (height * Self.windowAspect).rounded(), height: height)
+    }
+
+    /// 保留保存的窗口尺寸（没有就用默认尺寸），在当前屏幕去掉菜单栏和程序坞后的区域里居中；放不下就等比缩小
     private func centeredRect(for screen: NSScreen, savedFrame: NSRect?) -> NSRect {
         let visibleFrame = screen.visibleFrame
-        let frame = screen.frame
-        let width = max(savedFrame?.width ?? visibleFrame.width * 0.4, minimumContentSize.width, minimumContentSize.height * 4/3)
-        let height = savedFrame?.height ?? width * 3/4
-        return NSRect(x: frame.midX - width/2, y: frame.midY - height/2, width: width, height: height)
+        var size = savedFrame?.size ?? defaultWindowSize(for: screen)
+        let fit = min(1, visibleFrame.width / size.width, visibleFrame.height / size.height)
+        size = NSSize(width: (size.width * fit).rounded(), height: (size.height * fit).rounded())
+        return NSRect(x: (visibleFrame.midX - size.width / 2).rounded(),
+                      y: (visibleFrame.midY - size.height / 2).rounded(),
+                      width: size.width, height: size.height)
     }
     
     private func getCurrentActiveScreen() -> NSScreen? {
@@ -799,7 +898,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func windowDidResignKey(_ notification: Notification) { autoHideIfNeeded() }
     func windowDidResignMain(_ notification: Notification) { autoHideIfNeeded() }
     private func autoHideIfNeeded() {
-        guard !appStore.isSetting, !isAnimatingWindowTransition else { return }
+        guard !appStore.isSetting, !appStore.isPresentingAlert, !isAnimatingWindowTransition else { return }
         requestHideWindow()
     }
     

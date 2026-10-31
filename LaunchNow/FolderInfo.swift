@@ -1,6 +1,5 @@
 import Foundation
 import AppKit
-import SwiftData
 import UniformTypeIdentifiers
 
 struct FolderInfo: Identifiable, Equatable {
@@ -208,10 +207,10 @@ enum LaunchpadItem: Identifiable, Equatable {
 }
 
 // MARK: - 统一持久化模型（顶层项：应用或文件夹）
-@Model
-final class TopItemData {
+// 存在 layout.json 里（见 LayoutStore.swift），主键唯一由 ModelContext.insert 保证
+final class TopItemData: Codable {
     // 统一主键：对于应用可使用 appPath，对于文件夹使用 folderId
-    @Attribute(.unique) var id: String
+    var id: String
     var kind: String                 // "app" or "folder"
     var orderIndex: Int              // 顶层混合顺序索引
     // 应用字段
@@ -272,10 +271,9 @@ final class TopItemData {
 }
 
 // MARK: - 每页独立排序持久化模型（按“页-槽位”存储）
-@Model
-final class PageEntryData {
+final class PageEntryData: Codable {
     // 槽位唯一键：例如 "page-0-pos-3"
-    @Attribute(.unique) var slotId: String
+    var slotId: String
     var pageIndex: Int
     var position: Int
     var kind: String          // "app" | "folder" | "empty"

@@ -211,6 +211,14 @@ struct LaunchpadView: View {
         return result
     }
     
+    /// 图标边长：先给下方名字留出空间（名字 + 间距 + 上下留白约 40pt，再多留 4pt 和下一排隔开），再按设置缩放。
+    /// 取整到整点：图标按像素画好，边长带小数会被再缩放一次，边缘发糊
+    private func iconSide(columnWidth: CGFloat, appHeight: CGFloat) -> CGFloat {
+        let labelBlock: CGFloat = appStore.showAppNameBelowIcon ? 44 : 16
+        let fit = max(24, min(columnWidth, appHeight - labelBlock))
+        return (fit * CGFloat(max(0.4, min(appStore.iconScale, 1.6)))).rounded(.down)
+    }
+
     var body: some View {
         GeometryReader { geo in
             let actualTopPadding = config.isFullscreen ? geo.size.height * config.topPadding : 0
@@ -223,7 +231,10 @@ struct LaunchpadView: View {
                     Spacer()
                         .frame(height: actualTopPadding)
                 }
-                HStack(spacing: 8) {
+                HStack(spacing: 12) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.title)
+                        .foregroundStyle(.secondary)
                     TextField(NSLocalizedString("Search", comment: "Search"), text: $appStore.searchText)
                     .disabled(isFolderOpen)
                     .onChange(of: appStore.searchText) {
@@ -256,14 +267,18 @@ struct LaunchpadView: View {
                         SettingsView(appStore: appStore)
                     }
                 }
-                .padding(.top)
-                .padding(.horizontal)
+                .padding(.top, 2)
+                .padding(.horizontal, 4)
                 .opacity(isFolderOpen ? 0.1 : 1)
                 .allowsHitTesting(!isFolderOpen)
-                
+
+                // 与 LaunchOS 一致：分隔线横贯整个窗口
                 Divider()
                     .foregroundStyle(.placeholder)
-                    .padding()
+                    .padding(.top, 10)
+                    .padding(.bottom, config.windowedGridTopInset(for: geo.size))
+                    // 抵消外层 16pt 的 padding，让分隔线在窗口模式下横贯整个窗口
+                    .padding(.horizontal, config.isFullscreen ? 0 : -16)
                     .opacity(isFolderOpen ? 0.1 : 1)
                 
                 GeometryReader { geo in
@@ -284,7 +299,7 @@ struct LaunchpadView: View {
                         return max(40, width)
                     }()
 
-                    let iconSize: CGFloat = min(columnWidth, appHeight) * CGFloat(max(0.4, min(appStore.iconScale, 1.6)))
+                    let iconSize: CGFloat = iconSide(columnWidth: columnWidth, appHeight: appHeight)
 
                     let effectivePageWidth = geo.size.width + config.pageSpacing
 
@@ -332,7 +347,7 @@ struct LaunchpadView: View {
                                                         columnWidth: columnWidth,
                                                         iconSize: iconSize,
                                                         appHeight: appHeight,
-                                                        labelWidth: columnWidth * 0.9,
+                                                        labelWidth: columnWidth,
                                                         isSelected: (!isFolderOpen && isKeyboardNavigationActive && selectedIndex == globalIndex)
                                                     )
                                                 }
@@ -354,7 +369,7 @@ struct LaunchpadView: View {
 
                             // 将预览提升到外层坐标空间，避免受到 offset 影响
                             if let draggingItem {
-                                DragPreviewItem(item: draggingItem, iconSize: iconSize, labelWidth: columnWidth * 0.9, scale: dragPreviewScale)
+                                DragPreviewItem(item: draggingItem, iconSize: iconSize, labelWidth: columnWidth, scale: dragPreviewScale)
                                     .position(x: dragPreviewPosition.x, y: dragPreviewPosition.y)
                                     .opacity(dragPreviewOpacity)
                                     .zIndex(100)
@@ -427,13 +442,15 @@ struct LaunchpadView: View {
                         }
                         // 新增：当图标缩放改变时，立刻重算 currentIconSize，推动文件夹内部图标即时刷新
                         .onChange(of: appStore.iconScale) {
-                            let newSize = min(currentColumnWidth, currentAppHeight) * CGFloat(max(0.4, min(appStore.iconScale, 1.6)))
+                            let newSize = iconSide(columnWidth: currentColumnWidth, appHeight: currentAppHeight)
                             if newSize > 0 {
                                 currentIconSize = newSize
                             }
                         }
                     }
                 }
+                .padding(.horizontal, config.windowedHorizontalInset(for: geo.size))
+                .padding(.bottom, config.windowedBottomInset(for: geo.size))
                 
                 // Merged PageIndicator - add tap to jump to page
                 if pages.count > 1 {
@@ -726,9 +743,7 @@ struct LaunchpadView: View {
     }
     
     private func launchApp(_ app: AppInfo) {
-        AppDelegate.shared?.requestHideWindow {
-            NSWorkspace.shared.open(app.url)
-        }
+        AppDelegate.shared?.hideAndOpen(app.url)
     }
     
     private func handleItemTap(_ item: LaunchpadItem) {
@@ -1259,16 +1274,20 @@ extension LaunchpadView {
             // 保持稳定的视图身份，避免在文件夹更新后中断拖拽手势
             .id(item.id)
             .contextMenu {
-                if case .app(let app) = item, !appStore.folders.isEmpty {
-                    Menu(NSLocalizedString("MoveToFolder", comment: "Move to folder")) {
-                        ForEach(appStore.folders) { folder in
-                            Button(action: {
-                                appStore.addAppToFolder(app, folder: folder)
-                            }) {
-                                Label(folder.name, systemImage: "folder")
+                if case .app(let app) = item {
+                    if !appStore.folders.isEmpty {
+                        Menu(NSLocalizedString("MoveToFolder", comment: "Move to folder")) {
+                            ForEach(appStore.folders) { folder in
+                                Button(action: {
+                                    appStore.addAppToFolder(app, folder: folder)
+                                }) {
+                                    Label(folder.name, systemImage: "folder")
+                                }
                             }
                         }
+                        Divider()
                     }
+                    AppContextMenuItems(app: app, appStore: appStore)
                 }
             }
 
@@ -2206,8 +2225,21 @@ struct GridConfig {
     
     let maxBounce: CGFloat = 80
     let pageSpacing: CGFloat = 100
-    let rowSpacing: CGFloat = 16
+    // 窗口模式行距为 0：每格高度已含名字和上下留白（见 iconSide），整页正好铺满
+    var rowSpacing: CGFloat { isFullscreen ? 16 : 0 }
     let columnSpacing: CGFloat = 24
+    // 窗口模式下网格四周的留白，随窗口大小等比放大（全屏模式用下面按比例的 padding）。
+    // 默认窗口（约 980×840）下：左右 34、下 25、分隔线下 25
+    func windowedHorizontalInset(for size: CGSize) -> CGFloat {
+        isFullscreen ? 0 : (size.width * 0.035).rounded()
+    }
+    func windowedBottomInset(for size: CGSize) -> CGFloat {
+        isFullscreen ? 0 : (size.height * 0.03).rounded()
+    }
+    /// 分隔线和第一排图标之间的空隙
+    func windowedGridTopInset(for size: CGSize) -> CGFloat {
+        isFullscreen ? 16 : (size.height * 0.03).rounded()
+    }
     
     struct PageNavigation {
         let edgeFlipMargin: CGFloat = 2
@@ -2236,12 +2268,13 @@ struct DragPreviewItem: View {
     let iconSize: CGFloat
     let labelWidth: CGFloat
     var scale: CGFloat = 1.2
-    
+    @Environment(\.displayScale) private var displayScale
+
     // 性能优化：使用计算属性避免状态修改
     private var displayIcon: NSImage {
         switch item {
         case .app(let app):
-            return app.icon
+            return CrispIcon.image(app.displayIcon, id: app.url.path, side: iconSize, scale: displayScale)
         case .folder(let folder):
             return folder.icon(of: iconSize)
         case .empty:
@@ -2258,12 +2291,8 @@ struct DragPreviewItem: View {
                     .interpolation(.high)
                     .antialiased(true)
                     .frame(width: iconSize, height: iconSize)
-                Text(app.name)
-                    .font(.default)
+                AppNameLabel(name: app.name, width: labelWidth)
                     .foregroundColor(.primary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .frame(width: labelWidth)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
             }
@@ -2280,7 +2309,7 @@ struct DragPreviewItem: View {
                         .shadow(radius: 4)
                         .overlay(
                             RoundedRectangle(cornerRadius: iconSize * 0.2)
-                                .stroke(Color.foundary.opacity(0.5), lineWidth: 2)
+                                .stroke(Color.foundary.opacity(0.18), lineWidth: 1)
                         )
                     Image(nsImage: folder.icon(of: iconSize))
                         .resizable()
@@ -2289,12 +2318,8 @@ struct DragPreviewItem: View {
                         .frame(width: iconSize, height: iconSize)
                 }
                 
-                Text(folder.name)
-                    .font(.default)
+                AppNameLabel(name: folder.name, width: labelWidth)
                     .foregroundColor(.primary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .frame(width: labelWidth)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
             }

@@ -17,6 +17,7 @@ struct LaunchpadItemButton: View {
     @State private var isHovered = false
     @State private var lastTapTime = Date.distantPast
     @State private var folderIconRefreshToken: UInt = 0
+    @Environment(\.displayScale) private var displayScale
     private let doubleTapThreshold: TimeInterval = 0.3
     
     private var effectiveScale: CGFloat {
@@ -34,16 +35,7 @@ struct LaunchpadItemButton: View {
     private func resolveIcon() -> NSImage {
         switch item {
         case .app(let app):
-            if let cachedIcon = AppCacheManager.shared.getCachedIcon(for: app.url.path),
-               cachedIcon.size.width > 0, cachedIcon.size.height > 0 {
-                return cachedIcon
-            }
-            let base = app.icon
-            if base.size.width > 0 && base.size.height > 0 {
-                return base
-            } else {
-                return NSWorkspace.shared.icon(forFile: app.url.path)
-            }
+            return CrispIcon.image(app.displayIcon, id: app.url.path, side: iconSize, scale: displayScale)
         case .folder(let folder):
             return folder.icon(of: iconSize)
         case .empty:
@@ -86,7 +78,7 @@ struct LaunchpadItemButton: View {
                             .shadow(radius: 4)
                             .overlay(
                                 RoundedRectangle(cornerRadius: iconSize * 0.2)
-                                    .stroke(Color.foundary.opacity(0.5), lineWidth: 2)
+                                    .stroke(Color.foundary.opacity(0.18), lineWidth: 1)
                             )
                     }
                     
@@ -101,13 +93,9 @@ struct LaunchpadItemButton: View {
                 .animation(LNAnimations.easeInOut, value: isHovered || isSelected)
 
                 if showAppNameBelowIcon {
-                    Text(item.name)
-                        .font(.default)
-                        .lineLimit(2)
-                        .multilineTextAlignment(.center)
-                        .truncationMode(.tail)
-                        .frame(width: labelWidth)
+                    AppNameLabel(name: item.name, width: labelWidth)
                         .foregroundStyle(.primary)
+                        .shadow(color: .black.opacity(0.25), radius: 1, y: 0.5)
                 }
             }
         }
@@ -184,5 +172,24 @@ extension LaunchpadItemButton: Equatable {
         lhs.showAppNameBelowIcon == rhs.showAppNameBelowIcon &&
         lhs.shouldAllowHover == rhs.shouldAllowHover &&
         lhs.externalScale == rhs.externalScale
+    }
+}
+
+/// 图标下方的名字，尽量显示完整：单行，放不下就把字号缩小（最小到 65%）。
+/// 不折成两行：行高按一行字算，第二行会被下一排图标压住
+struct AppNameLabel: View {
+    let name: String
+    let width: CGFloat
+
+    var body: some View {
+        Text(name)
+            .font(.system(size: 13, weight: .medium))
+            .lineLimit(1)
+            .minimumScaleFactor(0.65)
+            .allowsTightening(true)
+            .multilineTextAlignment(.center)
+            // 高度按字号自然撑开，只有宽度放不下才缩小；不然格子偏矮时短名字也会被缩小
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(width: width)
     }
 }

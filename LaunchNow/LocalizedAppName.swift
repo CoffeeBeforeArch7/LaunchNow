@@ -10,6 +10,14 @@ public func localizedAppName(for bundleURL: URL) -> String {
         return special
     }
 
+    // 0.5) 与访达 / LaunchOS 一致：优先用系统给出的本地化显示名
+    //      （微信、飞书、Visual Studio Code，而不是 WeChat、Feishu、Code）
+    if let values = try? bundleURL.resourceValues(forKeys: [.localizedNameKey]),
+       var name = values.localizedName, !name.isEmpty {
+        if name.hasSuffix(".app") { name = String(name.dropLast(4)) }
+        return name
+    }
+
     let languagesToTry = preferredLanguageOrder(for: bundle)
 
     // 1) Read InfoPlist.strings in the best matching .lproj folder

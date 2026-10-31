@@ -71,3 +71,13 @@
 
 "Gesture" = "4-Finger Trackpad Gesture";
 "MaterialOpacity" = "Material opacity";
+
+/* Context menu: show in Finder / hide / move to Trash */
+"ShowInFinder" = "Show in Finder";
+"HideFromLaunchNow" = "Hide from LaunchNow";
+"MoveToTrashEllipsis" = "Move to Trash…";
+"MoveToTrash" = "Move to Trash";
+"MoveToTrashConfirmTitle" = "Move “%@” to the Trash?";
+"MoveToTrashConfirmMessage" = "The app will be moved to the Trash. You can put it back from the Trash if you need it.";
+"MoveToTrashFailedTitle" = "Couldn’t move “%@” to the Trash";
+"MoveToTrashFailedMessage" = "This app was probably installed with an installer package and needs administrator permission to remove. Drag it to the Trash in Finder and enter your password when asked.";

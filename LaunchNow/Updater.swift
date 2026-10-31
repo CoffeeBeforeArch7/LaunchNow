@@ -18,32 +18,14 @@ class Updater: ObservableObject {
     @Published var alertMessage = ""
     @Published var alertURL: URL? = nil
     
+    // 自用改版：不再从原作者仓库检查更新，免得下载原版把改版覆盖掉；
+    // 上游有新版本时手动合并代码后重新编译。
     func checkForUpdate() {
-        guard let url = URL(string: "https://api.github.com/repos/\(owner)/\(repo)/releases/latest") else { return }
-        
-        URLSession.shared.dataTask(with: url) { data, _, _ in
-            guard let data = data,
-                  let release = try? JSONDecoder().decode(GitHubRelease.self, from: data) else {
-                return
-            }
-            
-            let currentVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
-            
-            DispatchQueue.main.async {
-                if self.isVersion(release.tag_name, greaterThan: currentVersion) {
-                    // 有新版本
-                    self.alertTitle = NSLocalizedString("FoundNewVersion", comment: "Found New Version: ") + "\(release.tag_name)"
-                    self.alertMessage = NSLocalizedString("GoToGithub", comment: "Go to Github to download the latest version")
-                    self.alertURL = URL(string: release.html_url)
-                } else {
-                    // 已是最新版
-                    self.alertTitle = NSLocalizedString("AlreadyLatest", comment: "Already the latest version: ") + "v\(currentVersion)"
-                    self.alertMessage = NSLocalizedString("Enjoy", comment: "Enjoy")
-                    self.alertURL = nil
-                }
-                self.showAlert = true
-            }
-        }.resume()
+        let currentVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
+        alertTitle = "自用改版 v\(currentVersion)"
+        alertMessage = "基于 \(owner)/\(repo) 修改，不从 GitHub 检查更新。"
+        alertURL = nil
+        showAlert = true
     }
     
     /// 从左到右比较版本号
