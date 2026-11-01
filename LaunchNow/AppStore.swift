@@ -120,7 +120,6 @@ final class AppStore: ObservableObject {
     private var fsEventStream: FSEventStreamRef?
     private var pendingChangedAppPaths: Set<String> = []
     private var pendingForceFullScan: Bool = false
-    private let fullRescanThreshold: Int = 50
 
     // 状态标记
     private var hasPerformedInitialScan: Bool = false
@@ -1113,124 +1112,17 @@ final class AppStore: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: work)
     }
 
+    /// 文件变化后统一走保序扫描：新 App 放到当前页末尾（放不下就放最后一页），删掉的留空位，界面开着也会马上更新。
+    /// 原来分两条路，新装的 App 都可能看不到：整体扫描最后用存档的布局覆盖，存档里没有的新 App 被丢掉，
+    /// 直到关窗口时再扫一遍才出现；增量更新则把新 App 接在所有空位后面，跑到新的一页
     private func performImmediateRefresh() {
-        var shouldFull = false
-        var changed: Set<String> = []
         fsEventsStateLock.lock()
-        shouldFull = pendingForceFullScan || pendingChangedAppPaths.count > fullRescanThreshold
-        if shouldFull {
-            pendingForceFullScan = false
-            pendingChangedAppPaths.removeAll()
-        } else {
-            changed = pendingChangedAppPaths
-            pendingChangedAppPaths.removeAll()
-        }
+        let hasChanges = pendingForceFullScan || !pendingChangedAppPaths.isEmpty
+        pendingForceFullScan = false
+        pendingChangedAppPaths.removeAll()
         fsEventsStateLock.unlock()
-        
-        if shouldFull {
-            scanApplications()
-            return
-        }
-        
-        if !changed.isEmpty {
-            applyIncrementalChanges(for: changed)
-        }
-    }
-
-
-    private func applyIncrementalChanges(for changedPaths: Set<String>) {
-        guard !changedPaths.isEmpty else { return }
-        
-        // 将磁盘与图标解析放到后台，主线程仅应用结果，减少卡顿
-        let snapshotApps = self.apps
-        refreshQueue.async { [weak self] in
-            guard let self else { return }
-            
-            enum PendingChange {
-                case insert(AppInfo)
-                case update(AppInfo)
-                case remove(String) // path
-            }
-            var changes: [PendingChange] = []
-            var pathToIndex: [String: Int] = [:]
-            for (idx, app) in snapshotApps.enumerated() { pathToIndex[app.url.path] = idx }
-            
-            for path in changedPaths {
-                let url = URL(fileURLWithPath: path).resolvingSymlinksInPath()
-                let exists = FileManager.default.fileExists(atPath: url.path)
-                let valid = exists && self.isValidApp(at: url) && !self.isInsideAnotherApp(url)
-                if valid {
-                    let info = self.appInfo(from: url)
-                    if pathToIndex[url.path] != nil {
-                        changes.append(.update(info))
-                    } else {
-                        changes.append(.insert(info))
-                    }
-                } else {
-                    changes.append(.remove(url.path))
-                }
-            }
-            
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                
-                // 应用删除
-                if changes.contains(where: { if case .remove = $0 { return true } else { return false } }) {
-                    var indicesToRemove: [Int] = []
-                    var map: [String: Int] = [:]
-                    for (idx, app) in self.apps.enumerated() { map[app.url.path] = idx }
-                    for change in changes {
-                        if case .remove(let path) = change, let idx = map[path] {
-                            indicesToRemove.append(idx)
-                        }
-                    }
-                    for idx in indicesToRemove.sorted(by: >) {
-                        let removed = self.apps.remove(at: idx)
-                        for fIdx in self.folders.indices { self.folders[fIdx].apps.removeAll { $0 == removed } }
-                        if !self.items.isEmpty {
-                            for i in 0..<self.items.count {
-                                if case let .app(a) = self.items[i], a == removed { self.items[i] = .empty(UUID().uuidString) }
-                            }
-                        }
-                    }
-                    self.rebuildItems()
-                }
-                
-                // 应用更新
-                let updates: [AppInfo] = changes.compactMap { if case .update(let info) = $0 { return info } else { return nil } }
-                if !updates.isEmpty {
-                    var map: [String: Int] = [:]
-                    for (idx, app) in self.apps.enumerated() { map[app.url.path] = idx }
-                    for info in updates {
-                        if let idx = map[info.url.path], self.apps.indices.contains(idx) { self.apps[idx] = info }
-                        for fIdx in self.folders.indices {
-                            for aIdx in self.folders[fIdx].apps.indices where self.folders[fIdx].apps[aIdx].url.path == info.url.path {
-                                self.folders[fIdx].apps[aIdx] = info
-                            }
-                        }
-                        for iIdx in self.items.indices {
-                            if case .app(let a) = self.items[iIdx], a.url.path == info.url.path { self.items[iIdx] = .app(info) }
-                        }
-                    }
-                    self.rebuildItems()
-                }
-                
-                // 新增应用
-                let inserts: [AppInfo] = changes.compactMap { if case .insert(let info) = $0 { return info } else { return nil } }
-                if !inserts.isEmpty {
-                    self.apps.append(contentsOf: inserts)
-                    self.apps.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-                    self.rebuildItems()
-                }
-                
-                // 刷新与持久化
-                self.triggerFolderUpdate()
-                self.triggerGridRefresh()
-                self.saveAllOrder()
-                self.pruneEmptyFolders()
-                self.updateCacheAfterChanges()
-            }
-        }
+        guard hasChanges else { return }
+        scanApplicationsWithOrderPreservation()
     }
 
     private func canonicalAppBundlePath(for rawPath: String) -> String? {
@@ -1247,7 +1139,14 @@ final class AppStore: ObservableObject {
 
     private func isValidApp(at url: URL) -> Bool {
         FileManager.default.fileExists(atPath: url.path) &&
-        NSWorkspace.shared.isFilePackage(atPath: url.path)
+        NSWorkspace.shared.isFilePackage(atPath: url.path) &&
+        !Self.isRollbackCopy(url)
+    }
+
+    /// 回滚用的备份副本（有的 App 每次升级都会留下 XXX-backup.app）不放进启动台：
+    /// 文件名以「-backup」结尾的不算 App。名字每次都变，靠「从 LaunchNow 中隐藏」挡不住
+    static func isRollbackCopy(_ url: URL) -> Bool {
+        url.deletingPathExtension().lastPathComponent.lowercased().hasSuffix("-backup")
     }
 
     private func appInfo(from url: URL) -> AppInfo {
