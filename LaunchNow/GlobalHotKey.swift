@@ -1,10 +1,11 @@
 import Carbon.HIToolbox
 import Foundation
 
-// MARK: - 全局快捷键（默认 ⌘空格）
+// MARK: - 全局快捷键（默认 ⌥空格）
 //
 // 用 Carbon 的 RegisterEventHotKey：不需要辅助功能权限。
-// ⌘空格默认属于聚焦搜索，要先在 系统设置 ▸ 键盘 ▸ 键盘快捷键 ▸ 聚焦 里关掉它。
+// ⌘空格留给系统的聚焦搜索（计算器、汇率换算等）。⌥空格不是系统快捷键，平时只打出一个不换行空格；
+// 注册成全局快捷键后由 LaunchNow 接管。ChatGPT 的快捷对话框默认也是 ⌥空格，谁先注册归谁（LaunchNow 开机自启）。
 
 final class GlobalHotKey {
     static let shared = GlobalHotKey()
@@ -16,7 +17,7 @@ final class GlobalHotKey {
     /// 注册快捷键，按下时在主线程执行 action。成功返回 true。
     @discardableResult
     func register(keyCode: UInt32 = UInt32(kVK_Space),
-                  modifiers: UInt32 = UInt32(cmdKey),
+                  modifiers: UInt32 = UInt32(optionKey),
                   action: @escaping () -> Void) -> Bool {
         unregister()
         self.action = action

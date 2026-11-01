@@ -155,7 +155,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         previousApp = front
     }
 
-    /// 窗口收起后：撤掉遮罩；按 Esc / ⌘空格 / 点遮罩收起时把焦点还给之前的 App
+    /// 窗口收起后：撤掉遮罩；按 Esc / ⌥空格 / 点遮罩收起时把焦点还给之前的 App
     /// （点了别的 App 或打开了 App 的，焦点已经在那边，不用还）
     private func didHideWindow() {
         backdrop.hide(fadeDuration: 0)
@@ -166,7 +166,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         refocusPreviousOnHide = true
     }
 
-    /// ⌘空格：显示或隐藏启动台
+    /// ⌥空格：显示或隐藏启动台
     func toggleWindow() {
         if window?.isVisible == true {
             requestHideWindow()
