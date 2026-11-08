@@ -64,6 +64,7 @@
 "ResetToDefault" = "恢复默认";
 "NoFolders" = "暂无文件夹";
 
+"PanelSize" = "整体大小";
 "IconSize" = "图标大小";
 "Small" = "小";
 "Large" = "大";

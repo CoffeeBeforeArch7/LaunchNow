@@ -43,11 +43,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private var window: NSWindow?
-    private let minimumContentSize = NSSize(width: 700, height: 600)
+    /// 「整体大小」最小 60%：840 × 0.6 = 504 高，按 7:6 宽 588
+    private let minimumContentSize = NSSize(width: 588, height: 504)
     /// 窗口宽高比 7:6：7 列 5 行、带名字的网格正好是这个比例，图标能放大又不挤
     private static let windowAspect: CGFloat = 7.0 / 6.0
-    /// 打开时铺在下面、盖住其它窗口的模糊墙纸
-    private let backdrop = DesktopBackdrop()
+    /// 「整体大小」100% 时的窗口高度，也是默认大小（宽 980）。拖窗口边缘最大也到这里
+    private static let referenceHeight: CGFloat = 840
+    /// 打开时切到英文键盘，收起时切回原来的输入法
+    private let inputSource = InputSourceSwitcher()
     /// 打开前在用的 App：收起时把焦点还给它（不然焦点留在没有窗口的 LaunchNow 上，按键没反应）
     private var previousApp: NSRunningApplication?
     /// 打开别的 App 时不还焦点，交给新打开的那个
@@ -63,31 +66,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var gesturePreviewActivated = false
     private var gestureSearchFocusAssigned = false
     private var isAnimatingWindowTransition = false
+    /// 旧版存窗口 frame 的键，只在迁移时读一次（现在窗口大小只由「整体大小」决定，见 AppStore.panelScale）
     private static let windowFrameDefaultsKey = "savedWindowFrame"
-    
-    private var savedWindowFrame: NSRect? {
-        get {
-            guard let dict = UserDefaults.standard.dictionary(forKey: Self.windowFrameDefaultsKey) else { return nil }
-            guard let x = dict["x"] as? CGFloat,
-                  let y = dict["y"] as? CGFloat,
-                  let w = dict["width"] as? CGFloat,
-                  let h = dict["height"] as? CGFloat else { return nil }
-            return NSRect(x: x, y: y, width: w, height: h)
-        }
-        set {
-            guard let rect = newValue else {
-                UserDefaults.standard.removeObject(forKey: Self.windowFrameDefaultsKey)
-                return
-            }
-            let dict: [String: CGFloat] = [
-                "x": rect.origin.x,
-                "y": rect.origin.y,
-                "width": rect.width,
-                "height": rect.height
-            ]
-            UserDefaults.standard.set(dict, forKey: Self.windowFrameDefaultsKey)
-        }
-    }
     private var isRecentering: Bool = false
     private let showStartScale: CGFloat = 1.4
     private let previewActivationProgress: CGFloat = 0.08
@@ -104,15 +84,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         migrateWindowLayoutIfNeeded()
         setupWindow()
-        // 点遮罩（面板以外）收起；和失去焦点自动收起同样的条件：设置、确认框开着时不收
-        backdrop.onClick = { [weak self] in self?.autoHideIfNeeded() }
-        backdrop.prepare()
-        // 换了桌面（各桌面墙纸可以不同）就提前把那张墙纸处理好
-        NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main
-        ) { [weak self] _ in
-            self?.backdrop.prepare()
-        }
         bindGestureSettings()
         appStore.performInitialScanIfNeeded()
         appStore.startAutoRescan()
@@ -131,13 +102,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         )
     }
 
-    /// 第 2 版布局：窗口按屏幕变大、改成 7:6，图标随之变大。旧版存的窗口尺寸和图标缩放作废一次
+    /// 第 2 版布局：窗口按屏幕变大、改成 7:6，图标随之变大。旧版存的窗口尺寸和图标缩放作废一次。
+    /// 第 3 版：不再存窗口 frame，「整体大小」单独存；按旧 frame 的高度换算一次，大小不变
     private func migrateWindowLayoutIfNeeded() {
         let key = "windowLayoutVersion"
-        guard UserDefaults.standard.integer(forKey: key) < 2 else { return }
-        savedWindowFrame = nil
-        appStore.iconScale = 1.0
-        UserDefaults.standard.set(2, forKey: key)
+        let version = UserDefaults.standard.integer(forKey: key)
+        guard version < 3 else { return }
+        if version < 2 {
+            UserDefaults.standard.removeObject(forKey: Self.windowFrameDefaultsKey)
+            appStore.iconScale = 1.0
+        }
+        if let frame = UserDefaults.standard.dictionary(forKey: Self.windowFrameDefaultsKey),
+           let height = frame["height"] as? CGFloat, height > 0 {
+            appStore.panelScale = AppStore.clampedPanelScale(Double(height / Self.referenceHeight))
+        }
+        UserDefaults.standard.removeObject(forKey: Self.windowFrameDefaultsKey)
+        UserDefaults.standard.set(3, forKey: key)
     }
 
     /// 收起并打开 App（或系统设置等网址）：焦点交给新打开的那个，不切回之前的 App
@@ -148,17 +128,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    /// 打开前调用：记下当前在用的 App
-    private func rememberFrontmostApp() {
+    /// 打开前调用：记下当前在用的 App；切到英文键盘（在 LaunchNow 拿到焦点之前切，第一个字母就是英文）
+    private func prepareToShow() {
+        inputSource.switchToEnglish()
         guard let front = NSWorkspace.shared.frontmostApplication,
               front.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
         previousApp = front
     }
 
-    /// 窗口收起后：撤掉遮罩；按 Esc / ⌥空格 / 点遮罩收起时把焦点还给之前的 App
-    /// （点了别的 App 或打开了 App 的，焦点已经在那边，不用还）
+    /// 窗口收起后：切回原来的输入法（一般在开始收起时已经切过，这里兜底手势收起）；
+    /// 按 Esc / ⌥空格收起时把焦点还给之前的 App（点了别的 App 或打开了 App 的，焦点已经在那边，不用还）
     private func didHideWindow() {
-        backdrop.hide(fadeDuration: 0)
+        inputSource.restore()
         if refocusPreviousOnHide, NSApp.isActive, let previousApp, !previousApp.isTerminated {
             previousApp.activate(options: [])
         }
@@ -234,15 +215,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     
     private func setupWindow() {
         guard let screen = NSScreen.main else { return }
-        
-        // 非全屏模式下：加载上次保存的窗口尺寸；全屏模式使用屏幕尺寸
-        let rect: NSRect
-        if !appStore.isFullscreenMode {
-            rect = centeredRect(for: screen, savedFrame: savedWindowFrame)
-        } else {
-            rect = calculateContentRect(for: screen)
-        }
-        
+
+        // 按「整体大小」在屏幕上居中（全屏模式在显示时再铺满屏幕）
+        let rect = centeredRect(for: screen)
+
         // 非全屏模式下添加 .resizable 允许边缘拖拽调整大小
         let styleMask: NSWindow.StyleMask = appStore.isFullscreenMode
             ? [.borderless, .fullSizeContentView]
@@ -269,30 +245,44 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             appStore.configure(modelContext: context)
         }
         window?.contentView = NSHostingView(rootView: LaunchpadView(appStore: appStore))
-        
+
+        refreshLayoutScale()
         applyCornerRadius()
         applyPreviewVisual(scale: 1, alpha: 1)
         window?.alphaValue = 1
-        
-        // 设置等比缩放的参考内容尺寸（非全屏模式下使用实际窗口大小，而非计算默认值）
-        if !appStore.isFullscreenMode {
-            let refSize = rect.size
-            appStore.referenceContentSize = refSize
+    }
+
+    /// 按窗口实际高度更新面板缩放比例（拖边缘、「整体大小」、换屏、切换全屏都会走到这里）
+    private func refreshLayoutScale() {
+        guard let window else { return }
+        let scale = appStore.isFullscreenMode ? 1 : (window.frame.height / Self.referenceHeight * 100).rounded() / 100
+        guard scale != appStore.layoutScale else { return }
+        appStore.layoutScale = scale
+        applyCornerRadius()
+    }
+
+    /// 「整体大小」改了（设置里的滑块、拖完窗口边缘）：按新大小在当前屏幕居中；字号、间距随 windowDidResize 跟着变
+    func applyPanelScale() {
+        guard let window, !appStore.isFullscreenMode,
+              let screen = resolveScreen(for: window) else { return }
+        window.setFrame(centeredRect(for: screen), display: true)
+    }
+
+    /// 更新设置面板最多能多高：从窗口顶边（设置从这里垂下来）到屏幕可用区底边（程序坞上面）。
+    /// 窗口挪动、变大小、程序坞或屏幕变了都要重算
+    private func refreshSettingsMaxHeight() {
+        guard let window, let screen = resolveScreen(for: window) else { return }
+        let height = (window.frame.maxY - screen.visibleFrame.minY - 8).rounded()
+        if height != appStore.settingsMaxHeight {
+            appStore.settingsMaxHeight = height
         }
     }
-    
+
     private func finalizeShownState() {
         guard let window = window else { return }
-        let screen = getCurrentActiveScreen() ?? NSScreen.main!
         resetGesturePreviewState()
-        // 恢复保存的窗口 frame，或使用默认大小
-        let rect: NSRect
-        if !appStore.isFullscreenMode {
-            rect = centeredRect(for: screen, savedFrame: savedWindowFrame)
-        } else {
-            rect = screen.frame
-        }
-        window.setFrame(rect, display: true)
+        // 按「整体大小」在鼠标所在的屏幕居中，全屏模式铺满屏幕
+        window.setFrame(targetRectForCurrentScreen(), display: true)
         applyCornerRadius()
         applyPreviewVisual(scale: 1, alpha: 1)
         window.alphaValue = 1
@@ -300,11 +290,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.makeKey()
         lastShowAt = Date()
         NotificationCenter.default.post(name: .launchpadWindowShown, object: nil)
+        // 刚启动时第一次打开，开始显示时发的「聚焦搜索框」视图还没收到（onAppear 之后才订阅），这里再发一次
+        NotificationCenter.default.post(name: .launchpadFocusSearchField, object: nil)
         window.makeKeyAndOrderFront(nil)
         window.collectionBehavior = [.transient, .canJoinAllApplications, .fullScreenAuxiliary, .ignoresCycle]
         window.orderFrontRegardless()
-        // 手势打开不经过 performShowTransition，在这里补上
-        backdrop.show(below: window, fadeDuration: 0)
     }
 
     func requestShowWindow(completion: (() -> Void)? = nil) {
@@ -320,11 +310,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func finalizeHiddenState() {
-        // 隐藏前保存窗口 frame（非全屏模式下记住用户调整的大小和位置）
-        if let window = window, !appStore.isFullscreenMode {
-            savedWindowFrame = window.frame
-        }
         resetGesturePreviewState()
+        // 兜底：万一有手势卡在「进行中」（AppKit 会因此忽略所有点击），收起时清掉
+        window?.contentView?.cancelActiveGestureRecognizers()
         window?.orderOut(nil)
         didHideWindow()
         applyPreviewVisual(scale: 1, alpha: 1)
@@ -347,10 +335,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             completion?()
             return
         }
-        // 在隐藏前立即保存窗口 frame（确保任何隐藏路径都能记住尺寸）
-        if !appStore.isFullscreenMode {
-            savedWindowFrame = window.frame
-        }
         performWindowTransition(.hide, completion: completion)
     }
 
@@ -370,19 +354,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         isAnimatingWindowTransition = true
         resetGesturePreviewState()
         refocusPreviousOnHide = true
-        rememberFrontmostApp()
+        prepareToShow()
 
         let targetRect = targetRectForCurrentScreen()
 
         window.setFrame(targetRect, display: true)
         applyCornerRadius()
+        refreshSettingsMaxHeight()
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         window.collectionBehavior = [.transient, .canJoinAllApplications, .fullScreenAuxiliary, .ignoresCycle]
         window.orderFrontRegardless()
         NotificationCenter.default.post(name: .launchpadFocusSearchField, object: nil)
-        // 桌面上只留 LaunchNow：下面铺一层模糊墙纸盖住其它窗口，和面板一起淡入
-        backdrop.show(below: window, fadeDuration: 0.15)
 
         if appStore.isFullscreenMode {
             gesturePreviewTargetRect = targetRect
@@ -416,8 +399,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func performHideTransition(window: NSWindow, completion: (() -> Void)? = nil) {
         isAnimatingWindowTransition = true
         resetGesturePreviewState()
-        // 遮罩和面板一起淡出
-        backdrop.hide(fadeDuration: appStore.isFullscreenMode ? 0.2 : 0.15)
+        // 趁面板还是焦点时切回原来的输入法，接着焦点交给别的 App，中文输入法才真正生效
+        inputSource.restore()
 
         let targetRect = targetRectForCurrentScreen()
 
@@ -456,8 +439,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     
     func updateWindowMode(isFullscreen: Bool) {
         guard let window = window else { return }
-        let screen = getCurrentActiveScreen() ?? NSScreen.main!
-        window.setFrame(isFullscreen ? screen.frame : calculateContentRect(for: screen), display: true)
+        guard let screen = getCurrentActiveScreen() ?? NSScreen.main else { return }
+        window.setFrame(isFullscreen ? screen.frame : centeredRect(for: screen), display: true)
         window.hasShadow = !isFullscreen
         window.contentAspectRatio = isFullscreen ? NSSize(width: 0, height: 0) : NSSize(width: 7, height: 6)
         // 切换模式时更新 styleMask：非全屏模式下允许边缘拖拽调整大小
@@ -465,15 +448,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             ? [.borderless, .fullSizeContentView]
             : [.borderless, .fullSizeContentView, .resizable]
         window.styleMask = newStyleMask
-        // 切换模式时重置等比缩放参考尺寸
-        if !isFullscreen {
-            let refSize = calculateContentRect(for: screen).size
-            appStore.referenceContentSize = refSize
-        }
-        // 切换全屏时清除保存的 frame，切换窗口模式时重置参考尺寸
-        if isFullscreen {
-            savedWindowFrame = nil
-        }
+        refreshLayoutScale()
+        refreshSettingsMaxHeight()
         // 切换模式时重置手势状态和 layer 状态，避免模式间动画污染
         resetGesturePreviewState()
         if !isFullscreen {
@@ -488,7 +464,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func applyCornerRadius() {
         guard let contentView = window?.contentView else { return }
         contentView.wantsLayer = true
-        contentView.layer?.cornerRadius = appStore.isFullscreenMode ? 0 : 30
+        contentView.layer?.cornerRadius = appStore.isFullscreenMode ? 0 : 30 * appStore.layoutScale
         contentView.layer?.masksToBounds = true
         contentView.layer?.allowsEdgeAntialiasing = true
         configurePreviewLayerGeometry()
@@ -516,8 +492,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard gesturePreviewActivated else { return }
             if !window.isVisible {
                 gesturePreviewMadeVisible = true
-                rememberFrontmostApp()
-                backdrop.show(below: window, fadeDuration: 0.15)
+                prepareToShow()
                 window.setFrame(targetRect, display: true)
                 applyCornerRadius()
                 applyPreviewVisual(scale: previewScale(for: smoothedProgress), alpha: previewAlpha(for: smoothedProgress))
@@ -566,7 +541,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case .showing:
             rollbackToHidden(window: window)
         case .hiding where shouldCompleteCurrentGesture():
-            backdrop.hide(fadeDuration: 0.2)
             animatePreviewVisual(toScale: previewScale(for: 0), alpha: previewAlpha(for: 0)) {
                 self.finalizeHiddenState()
             }
@@ -577,10 +551,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func cancelGesturePreview() {
         guard let window else { return }
-        // 手势取消时隐藏窗口，也需要保存 frame
-        if !appStore.isFullscreenMode, window.isVisible {
-            savedWindowFrame = window.frame
-        }
         if let targetRect = gesturePreviewTargetRect {
             window.setFrame(targetRect, display: true)
             applyPreviewVisual(scale: 1, alpha: 1)
@@ -668,10 +638,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func rollbackToHidden(window: NSWindow) {
         guard gesturePreviewMadeVisible else { return }
-        // 回滚到隐藏状态时保存 frame
-        if !appStore.isFullscreenMode {
-            savedWindowFrame = window.frame
-        }
         animatePreviewVisual(toScale: previewScale(for: 0), alpha: previewAlpha(for: 0)) {
             window.orderOut(nil)
             self.didHideWindow()
@@ -712,13 +678,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         contentLayer.position = CGPoint(x: contentView.bounds.midX, y: contentView.bounds.midY)
     }
 
+    /// 全屏模式铺满鼠标所在的屏幕；窗口模式按「整体大小」在这块屏幕上居中
     private func targetRectForCurrentScreen() -> NSRect {
-        let screen = getCurrentActiveScreen() ?? NSScreen.main!
-        if appStore.isFullscreenMode {
-            return screen.frame
-        }
-        // 非全屏模式下，保留保存的窗口尺寸，在当前屏幕居中
-        return centeredRect(for: screen, savedFrame: savedWindowFrame)
+        guard let screen = getCurrentActiveScreen() ?? NSScreen.main else { return window?.frame ?? .zero }
+        return appStore.isFullscreenMode ? screen.frame : centeredRect(for: screen)
     }
 
     private func transitionPreviewModeIfNeeded(for direction: GlobalPinchGestureDirection) {
@@ -800,35 +763,43 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         max(0, (progress - 0.12) / 0.88)
     }
     
-    private func calculateContentRect(for screen: NSScreen) -> NSRect {
-        centeredRect(for: screen, savedFrame: nil)
+    /// 这块屏幕上面板最高多高：「整体大小」100% 的 840；屏幕矮的话到可用区域的 92%（留点边，不贴菜单栏和程序坞）
+    private func maxPanelHeight(for screen: NSScreen) -> CGFloat {
+        let visibleFrame = screen.visibleFrame
+        return min(Self.referenceHeight, visibleFrame.height * 0.92, visibleFrame.width * 0.92 / Self.windowAspect)
     }
 
-    /// 默认窗口：高约占可用高度的 84%（最高 880pt），宽按 7:6（1920×1080 的屏上约 980×840）
-    private func defaultWindowSize(for screen: NSScreen) -> NSSize {
-        let visibleFrame = screen.visibleFrame
-        var height = min(visibleFrame.height * 0.84, 880)
-        if height * Self.windowAspect > visibleFrame.width * 0.9 {
-            height = visibleFrame.width * 0.9 / Self.windowAspect
-        }
-        height = max(height, minimumContentSize.height).rounded()
+    /// 窗口模式的面板大小：高 = 840 × 「整体大小」，宽按 7:6。屏幕放不下时只是这次缩小，不改设置
+    private func panelSize(for screen: NSScreen) -> NSSize {
+        let height = min(Self.referenceHeight * CGFloat(appStore.panelScale), maxPanelHeight(for: screen)).rounded()
         return NSSize(width: (height * Self.windowAspect).rounded(), height: height)
     }
 
-    /// 保留保存的窗口尺寸（没有就用默认尺寸），在当前屏幕去掉菜单栏和程序坞后的区域里居中；放不下就等比缩小
-    private func centeredRect(for screen: NSScreen, savedFrame: NSRect?) -> NSRect {
+    /// 按「整体大小」在屏幕去掉菜单栏和程序坞后的区域里居中
+    private func centeredRect(for screen: NSScreen) -> NSRect {
         let visibleFrame = screen.visibleFrame
-        var size = savedFrame?.size ?? defaultWindowSize(for: screen)
-        let fit = min(1, visibleFrame.width / size.width, visibleFrame.height / size.height)
-        size = NSSize(width: (size.width * fit).rounded(), height: (size.height * fit).rounded())
+        let size = panelSize(for: screen)
         return NSRect(x: (visibleFrame.midX - size.width / 2).rounded(),
                       y: (visibleFrame.midY - size.height / 2).rounded(),
                       width: size.width, height: size.height)
     }
-    
+
+    /// 鼠标所在的屏幕。鼠标在屏幕最上面一行时 y 正好等于 frame.maxY，contains 不算在内：
+    /// 上下叠放的两块屏，交界处会算到上面那块，最顶上一行哪块都不算。NSMouseInRect 按鼠标的规矩算。
+    /// 万一哪块都不算（比如正好在最下面一行），取离鼠标最近的那块，而不是有焦点窗口的那块
     private func getCurrentActiveScreen() -> NSScreen? {
         let mouse = NSEvent.mouseLocation
-        return NSScreen.screens.first { $0.frame.contains(mouse) }
+        let screens = NSScreen.screens
+        if let hit = screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }) {
+            return hit
+        }
+        return screens.min { distance(from: mouse, to: $0.frame) < distance(from: mouse, to: $1.frame) }
+    }
+
+    private func distance(from point: NSPoint, to rect: NSRect) -> CGFloat {
+        let dx = max(rect.minX - point.x, 0, point.x - rect.maxX)
+        let dy = max(rect.minY - point.y, 0, point.y - rect.maxY)
+        return hypot(dx, dy)
     }
     
     private func resolveScreen(for window: NSWindow) -> NSScreen? {
@@ -848,34 +819,39 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc private func handleScreenParametersDidChange() {
         guard let window = window else { return }
         guard let screen = resolveScreen(for: window) else { return }
-        
-        if appStore.isFullscreenMode {
-            window.setFrame(screen.frame, display: true)
-            return
-        }
-        
-        let targetRect = centeredRect(for: screen, savedFrame: savedWindowFrame)
-        window.setFrame(targetRect, display: true)
-        savedWindowFrame = targetRect
+        // 换了屏幕、分辨率、程序坞：重新居中；屏幕放不下时只是临时缩小，不改「整体大小」
+        window.setFrame(appStore.isFullscreenMode ? screen.frame : centeredRect(for: screen), display: true)
+        refreshSettingsMaxHeight()
     }
-    
+
+    /// 拖窗口边缘：范围和「整体大小」滑块一样，最小 60%，最大 100%（屏幕放不下时到屏幕放得下的大小）
     func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
         let minSize = minimumContentSize
+        let maxHeight = (sender.screen ?? getCurrentActiveScreen()).map(maxPanelHeight) ?? Self.referenceHeight
+        let maxSize = NSSize(width: (maxHeight * Self.windowAspect).rounded(), height: maxHeight.rounded())
         let contentSize = sender.contentRect(forFrameRect: NSRect(origin: .zero, size: frameSize)).size
-        let clamped = NSSize(width: max(contentSize.width, minSize.width), height: max(contentSize.height, minSize.height))
+        let clamped = NSSize(width: min(max(contentSize.width, minSize.width), maxSize.width),
+                             height: min(max(contentSize.height, minSize.height), maxSize.height))
         return sender.frameRect(forContentRect: NSRect(origin: .zero, size: clamped)).size
     }
-    
+
+    /// 拖完窗口边缘：记成「整体大小」，设置里的滑块跟着变
+    func windowDidEndLiveResize(_ notification: Notification) {
+        guard let window, !appStore.isFullscreenMode else { return }
+        appStore.panelScale = AppStore.clampedPanelScale(Double(window.frame.height / Self.referenceHeight))
+    }
+
+    func windowDidMove(_ notification: Notification) {
+        refreshSettingsMaxHeight()
+    }
+
     func windowDidResize(_ notification: Notification) {
+        refreshLayoutScale()
+        refreshSettingsMaxHeight()
         guard !appStore.isFullscreenMode, !isAnimatingWindowTransition else { return }
         guard let window = notification.object as? NSWindow, window.isVisible else { return }
         guard let screen = window.screen ?? getCurrentActiveScreen() else { return }
-        
-        // 用户手动调整窗口尺寸后，立即保存 frame（记住用户调整的大小）
-        if !isRecentering {
-            savedWindowFrame = window.frame
-        }
-        
+
         // 缩放后重新居中窗口
         guard !isRecentering else { return }
         isRecentering = true
@@ -911,12 +887,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return false
     }
     
-    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        // 应用退出前保存当前窗口尺寸
-        if let window = window, !appStore.isFullscreenMode, window.isVisible {
-            savedWindowFrame = window.frame
-        }
-        return .terminateNow
+    func applicationWillTerminate(_ notification: Notification) {
+        // 面板开着时退出（设置里的「退出」）：输入法切回去
+        inputSource.restore()
     }
     
 }

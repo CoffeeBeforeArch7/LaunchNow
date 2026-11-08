@@ -58,6 +58,7 @@
 "ResetToDefault" = "Reset to default";
 "NoFolders" = "No folders";
 
+"PanelSize" = "Panel size";
 "IconSize" = "Icon size";
 "Small" = "Small";
 "Large" = "Large";

@@ -11,7 +11,19 @@ struct SettingsView: View {
     @State private var pendingHiddenSelections: Set<String> = []
     @State private var appIconChoice = AppIconChoice.current
 
+    /// 设置约 840pt 高，面板缩小后会从屏幕下边跑出去：限高到屏幕放得下的高度，放不下就滚动。
+    /// ScrollView 的理想高度就是内容高度，加 maxHeight 一次排版就是 min(内容, 上限)，不用先量再改（不会闪一下）；
+    /// fixedSize 把这个高度定死：不然 sheet 会把可伸缩的内容压到比面板矮 40pt，面板小时设置也跟着变矮
     var body: some View {
+        ScrollView {
+            settingsContent
+        }
+        .frame(maxHeight: appStore.settingsMaxHeight)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    @ViewBuilder
+    private var settingsContent: some View {
         let hidableApps = appStore.hidableApps(searchText: hideAppSearchText)
         let hiddenApps = hidableApps.filter { appStore.isAppHidden(path: $0.url.path) }
         let addableApps = hidableApps.filter { !appStore.isAppHidden(path: $0.url.path) }
@@ -81,6 +93,30 @@ struct SettingsView: View {
                         }
                     }
                 }
+                // 窗口、图标、名字、间距一起按比例缩放；拖窗口边缘也是同一回事
+                HStack {
+                    Text(NSLocalizedString("PanelSize", comment: "Panel size"))
+                    VStack {
+                        Slider(value: $appStore.panelScale, in: AppStore.panelScaleRange, step: 0.05)
+                        HStack {
+                            Text(NSLocalizedString("Small", comment: "Small"))
+                                .font(.footnote)
+                            Spacer()
+                            Text("\(Int((appStore.panelScale * 100).rounded()))%")
+                                .font(.footnote)
+                                .monospacedDigit()
+                            Spacer()
+                            Text(NSLocalizedString("Large", comment: "Large"))
+                                .font(.footnote)
+                        }
+                    }
+                    Button {
+                        appStore.panelScale = 1.0
+                    } label: {
+                        Text(NSLocalizedString("DefaultSize", comment: "Default size"))
+                    }
+                }
+                .disabled(appStore.isFullscreenMode)
                 HStack {
                     Text(NSLocalizedString("IconSize", comment: "Icon size"))
                     VStack {
@@ -222,6 +258,8 @@ struct SettingsView: View {
                         }
                         .frame(height: 80)
                         .scrollIndicators(.hidden)
+                        // 列表放得下时不拦滚轮，交给外面整页滚动
+                        .scrollBounceBehavior(.basedOnSize)
                     }
                 }
             }
@@ -286,6 +324,7 @@ struct SettingsView: View {
                     }
                     .scrollIndicators(.hidden)
                     .frame(height: 80)
+                    .scrollBounceBehavior(.basedOnSize)
                 }
 
             }

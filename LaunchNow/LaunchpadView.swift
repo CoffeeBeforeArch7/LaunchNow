@@ -105,6 +105,13 @@ struct LaunchpadView: View {
     @StateObject private var pageFlipManager = PageFlipManager()
     @State private var folderHoverCandidateIndex: Int? = nil
     @State private var folderHoverBeganAt: Date? = nil
+    /// 拖着 App 停在文件夹上，到点就打开这个文件夹（见 springOpenFolder）
+    @State private var springLoadWorkItem: DispatchWorkItem? = nil
+    /// 停在图标之间、等着让位的那一格（见 requestReorder）
+    @State private var reorderCandidateIndex: Int? = nil
+    @State private var reorderWorkItem: DispatchWorkItem? = nil
+    /// 拖动被节流跳过后补的那次悬停判断
+    @State private var trailingHoverWorkItem: DispatchWorkItem? = nil
     @State private var selectedIndex: Int? = nil
     @State private var isKeyboardNavigationActive: Bool = false
     @FocusState private var isSearchFieldFocused: Bool
@@ -131,6 +138,8 @@ struct LaunchpadView: View {
     // 性能优化：使用静态缓存避免状态修改问题
     private static var geometryCache: [String: CGPoint] = [:]
     private static var lastGeometryUpdate: Date = Date.distantPast
+    /// 上次判断悬停目标的时间（拖拽节流用，见 applyDragUpdate）
+    private static var lastHoverEvaluation: Date = Date.distantPast
     private let geometryCacheTimeout: TimeInterval = 0.1 // 100ms缓存超时
     
     @State private var isHandoffDragging: Bool = false
@@ -159,7 +168,21 @@ struct LaunchpadView: View {
     }
     
     private var config: GridConfig {
-        GridConfig(isFullscreen: appStore.isFullscreenMode)
+        GridConfig(isFullscreen: appStore.isFullscreenMode, scale: layoutScale)
+    }
+
+    /// 「整体大小」的缩放比例：字号、间距、圆角都乘它（见 AppStore.layoutScale）
+    private var layoutScale: CGFloat { appStore.layoutScale }
+
+    /// 拖拽时亮托板的那一格：拖着的 App 停在另一个 App / 文件夹的图标上
+    private var dropTargetIndex: Int? {
+        guard draggingItem != nil, appStore.isDragCreatingFolder, !isSettlingDrop else { return nil }
+        return folderHoverCandidateIndex
+    }
+
+    /// 图标中心比格子中心高多少：格子里图标下面还有间距和名字（见 LaunchpadItemButton）
+    private var iconCenterOffset: CGFloat {
+        appStore.showAppNameBelowIcon ? (8 * layoutScale + 16 * AppStore.textScale(for: layoutScale)) / 2 : 0
     }
     
     var filteredItems: [LaunchpadItem] {
@@ -212,9 +235,12 @@ struct LaunchpadView: View {
     }
     
     /// 图标边长：先给下方名字留出空间（名字 + 间距 + 上下留白约 40pt，再多留 4pt 和下一排隔开），再按设置缩放。
+    /// 名字一行高 16pt 按小字的比例缩，其余 28pt 按整体比例缩（见 LaunchpadItemButton）。
     /// 取整到整点：图标按像素画好，边长带小数会被再缩放一次，边缘发糊
     private func iconSide(columnWidth: CGFloat, appHeight: CGFloat) -> CGFloat {
-        let labelBlock: CGFloat = appStore.showAppNameBelowIcon ? 44 : 16
+        let labelBlock: CGFloat = appStore.showAppNameBelowIcon
+            ? 28 * layoutScale + 16 * AppStore.textScale(for: layoutScale)
+            : 16 * layoutScale
         let fit = max(24, min(columnWidth, appHeight - labelBlock))
         return (fit * CGFloat(max(0.4, min(appStore.iconScale, 1.6)))).rounded(.down)
     }
@@ -225,15 +251,15 @@ struct LaunchpadView: View {
             let actualBottomPadding = config.isFullscreen ? geo.size.height * config.bottomPadding : 0
             let actualHorizontalPadding = config.isFullscreen ? geo.size.width * config.horizontalPadding : 0
             
-            VStack {
+            VStack(spacing: 8 * layoutScale) {
                 // 在顶部添加动态padding（全屏模式）
                 if config.isFullscreen {
                     Spacer()
                         .frame(height: actualTopPadding)
                 }
-                HStack(spacing: 12) {
+                HStack(spacing: 12 * layoutScale) {
                     Image(systemName: "magnifyingglass")
-                        .font(.title)
+                        .font(.system(size: 22 * layoutScale))
                         .foregroundStyle(.secondary)
                     TextField(NSLocalizedString("Search", comment: "Search"), text: $appStore.searchText)
                     .disabled(isFolderOpen)
@@ -249,17 +275,17 @@ struct LaunchpadView: View {
                         }
                     }
                     .focused($isSearchFieldFocused)
-                    .font(.title)
+                    .font(.system(size: 22 * layoutScale))
                     .textFieldStyle(.plain)
-                    
+
                     Spacer()
-                    
+
                     Button {
                         appStore.isSetting = true
                     } label: {
                         Image(systemName: "ellipsis.circle")
 
-                            .font(.title)
+                            .font(.system(size: 22 * layoutScale))
                             .foregroundStyle(.placeholder.opacity(0.6))
                     }
                     .buttonStyle(.plain)
@@ -267,18 +293,18 @@ struct LaunchpadView: View {
                         SettingsView(appStore: appStore)
                     }
                 }
-                .padding(.top, 2)
-                .padding(.horizontal, 4)
+                .padding(.top, 2 * layoutScale)
+                .padding(.horizontal, 4 * layoutScale)
                 .opacity(isFolderOpen ? 0.1 : 1)
                 .allowsHitTesting(!isFolderOpen)
 
                 // 与 LaunchOS 一致：分隔线横贯整个窗口
                 Divider()
                     .foregroundStyle(.placeholder)
-                    .padding(.top, 10)
+                    .padding(.top, 10 * layoutScale)
                     .padding(.bottom, config.windowedGridTopInset(for: geo.size))
                     // 抵消外层 16pt 的 padding，让分隔线在窗口模式下横贯整个窗口
-                    .padding(.horizontal, config.isFullscreen ? 0 : -16)
+                    .padding(.horizontal, config.isFullscreen ? 0 : -16 * layoutScale)
                     .opacity(isFolderOpen ? 0.1 : 1)
                 
                 GeometryReader { geo in
@@ -304,12 +330,12 @@ struct LaunchpadView: View {
                     let effectivePageWidth = geo.size.width + config.pageSpacing
 
                     if filteredItems.isEmpty && !appStore.searchText.isEmpty {
-                        VStack(spacing: 20) {
+                        VStack(spacing: 20 * layoutScale) {
                             Image(systemName: "magnifyingglass")
-                                .font(.largeTitle)
+                                .font(.system(size: 26 * layoutScale))
                                 .foregroundStyle(.placeholder)
                             Text(NSLocalizedString("NoAppsFound", comment: "No apps found"))
-                                .font(.title)
+                                .font(.system(size: 22 * layoutScale))
                                 .foregroundStyle(.placeholder)
                         }
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -325,6 +351,20 @@ struct LaunchpadView: View {
                                           !appStore.isFolderNameEditing else { return }
                                     AppDelegate.shared?.requestHideWindow()
                                 }
+                            // 拖着的 App 停在另一个 App / 文件夹上：目标图标后面亮一块托板，松手就合成文件夹 / 放进文件夹。
+                            // 画在这里而不是格子按钮里，和拖着的图标一样跟着拖拽状态即时刷新
+                            ZStack(alignment: .topLeading) {
+                                if let target = dropTargetIndex {
+                                    let center = cellCenter(for: target, in: currentContainerSize, pageIndex: appStore.currentPage,
+                                                            columnWidth: currentColumnWidth, appHeight: currentAppHeight)
+                                    DropTargetPlate(iconSize: iconSize)
+                                        .position(x: center.x, y: center.y - iconCenterOffset)
+                                        .transition(.scale(scale: 0.7).combined(with: .opacity))
+                                }
+                            }
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                            .animation(LNAnimations.dropTarget, value: dropTargetIndex)
+                            .allowsHitTesting(false)
                             // 内容
                             HStack(spacing: config.pageSpacing) {
                                 ForEach(pages.indices, id: \.self) { index in
@@ -369,7 +409,10 @@ struct LaunchpadView: View {
 
                             // 将预览提升到外层坐标空间，避免受到 offset 影响
                             if let draggingItem {
-                                DragPreviewItem(item: draggingItem, iconSize: iconSize, labelWidth: columnWidth, scale: dragPreviewScale)
+                                // 停在文件夹 / App 上时缩小一点，像要被吸进去，放大的目标从四周露出来
+                                DragPreviewItem(item: draggingItem, iconSize: iconSize, labelWidth: columnWidth,
+                                                scale: appStore.isDragCreatingFolder && !isSettlingDrop ? 0.9 : dragPreviewScale,
+                                                layoutScale: layoutScale)
                                     .position(x: dragPreviewPosition.x, y: dragPreviewPosition.y)
                                     .opacity(dragPreviewOpacity)
                                     .zIndex(100)
@@ -454,11 +497,11 @@ struct LaunchpadView: View {
                 
                 // Merged PageIndicator - add tap to jump to page
                 if pages.count > 1 {
-                    HStack(spacing: 8) {
+                    HStack(spacing: 8 * layoutScale) {
                         ForEach(0..<pages.count, id: \.self) { index in
                             Circle()
                                 .fill(appStore.currentPage == index ? Color.gray : Color.gray.opacity(0.3))
-                                .frame(width: 8, height: 8)
+                                .frame(width: 8 * layoutScale, height: 8 * layoutScale)
                                 .contentShape(Rectangle())
                                 .onTapGesture {
                                     navigateToPage(index)
@@ -477,21 +520,11 @@ struct LaunchpadView: View {
 
             }
             .padding(.horizontal, actualHorizontalPadding)
-            .onAppear {
-                if appStore.referenceContentSize == .zero {
-                    appStore.referenceContentSize = geo.size
-                }
-            }
-            .onChange(of: geo.size) {
-                if appStore.referenceContentSize == .zero {
-                    appStore.referenceContentSize = geo.size
-                }
-            }
         }
-        .padding()
+        .padding(16 * layoutScale)
         .background {
-            Color.clear.background(.ultraThinMaterial.opacity(appStore.materialOpacity), in: RoundedRectangle(cornerRadius: appStore.isFullscreenMode ? 0 : 30))
-            Color.clear.glassEffect(.clear, in: RoundedRectangle(cornerRadius: appStore.isFullscreenMode ? 0 : 30))
+            Color.clear.background(.ultraThinMaterial.opacity(appStore.materialOpacity), in: RoundedRectangle(cornerRadius: appStore.isFullscreenMode ? 0 : 30 * layoutScale))
+            Color.clear.glassEffect(.clear, in: RoundedRectangle(cornerRadius: appStore.isFullscreenMode ? 0 : 30 * layoutScale))
         }
         .ignoresSafeArea()
         .overlay(
@@ -539,8 +572,7 @@ struct LaunchpadView: View {
                 if let openFolder = appStore.openFolder {
                     Group {
                         GeometryReader { proxy in
-                            let isScaledFolder = !config.isFullscreen && appStore.referenceContentSize.width > 0
-                            let folderScale: CGFloat = isScaledFolder ? min(proxy.size.width / appStore.referenceContentSize.width, proxy.size.height / appStore.referenceContentSize.height, 1.0) : 1.0
+                            // 文件夹占面板的 70%；里面的字号、间距按「整体大小」缩放
                             let targetWidth = max(100, proxy.size.width * 0.7)
                             let targetHeight = max(100, proxy.size.height * 0.7)
                             let folderId = openFolder.id
@@ -590,11 +622,11 @@ struct LaunchpadView: View {
                                     )
                                     .transition(.opacity)
                                 } else {
-                                    FolderShellView(name: openFolder.name)
+                                    FolderShellView(name: openFolder.name, scale: layoutScale)
                                 }
                             }
                             .environmentObject(appStore)
-                            .frame(width: targetWidth * folderScale, height: targetHeight * folderScale)
+                            .frame(width: targetWidth, height: targetHeight)
                             .position(x: proxy.size.width / 2, y: proxy.size.height / 2)
                             .id("folder_\(folderId)")
                             
@@ -627,6 +659,13 @@ struct LaunchpadView: View {
                     guard !isHandoffDragging, !isFolderOpen, !appStore.isSetting else { return event }
                   switch event.type {
                   case .leftMouseDown:
+                      // 上一次拖拽没收到抬起（被别的监听吞了）：新的按下说明早就松手了，先按松手收尾，免得之后的拖拽都被挡住
+                      if draggingItem != nil, !isSettlingDrop, handoffEventMonitor == nil {
+                          finalizeDragOperation(containerSize: currentContainerSize,
+                                                columnWidth: currentColumnWidth,
+                                                appHeight: currentAppHeight,
+                                                iconSize: currentIconSize)
+                      }
                       guard draggingItem == nil else { return event }
                       let localPoint = convertScreenToGrid(NSEvent.mouseLocation)
                       if let idx = indexAt(point: localPoint, in: currentContainerSize,
@@ -843,6 +882,8 @@ struct LaunchpadView: View {
                 return nil
             case .leftMouseUp:
                 finalizeHandoffDrag()
+                // 吞掉抬起前取消还在跟踪这次按下的手势（按下是在文件夹里的图标上）
+                event.window?.contentView?.cancelActiveGestureRecognizers()
                 return nil
             default:
                 return event
@@ -870,8 +911,16 @@ struct LaunchpadView: View {
     }
 
     private func finalizeHandoffDrag() {
+        // 不管下面走哪条路都撤掉接力监听：留着它会吞掉之后所有的拖动和抬起，点什么都没反应
+        defer {
+            if let monitor = handoffEventMonitor {
+                NSEvent.removeMonitor(monitor)
+                handoffEventMonitor = nil
+            }
+        }
         guard !isSettlingDrop else { return }
         guard draggingItem != nil else { return }
+        settlePendingReorder()
         // 在接力拖拽模式下，落点时再计算目标索引，过程中不展示吸附
         if isHandoffDragging && pendingDropIndex == nil {
             if let idx = indexAt(point: dragPreviewPosition,
@@ -893,8 +942,6 @@ struct LaunchpadView: View {
         }
         // 让 finalizeDragOperation 处理落点排序逻辑（它内部会设置 isSettlingDrop）
         finalizeDragOperation(containerSize: currentContainerSize, columnWidth: currentColumnWidth, appHeight: currentAppHeight, iconSize: currentIconSize)
-
-        if let monitor = handoffEventMonitor { NSEvent.removeMonitor(monitor); handoffEventMonitor = nil }
     }
 
     private func navigateToPage(_ targetPage: Int, animated: Bool = true) {
@@ -1267,6 +1314,7 @@ extension LaunchpadView {
                 showAppNameBelowIcon: appStore.showAppNameBelowIcon,
                 shouldAllowHover: shouldAllowHover,
                 externalScale: isCenterCreatingTarget ? 1.2 : nil,
+                scale: layoutScale,
                 onTap: { if draggingItem == nil { handleItemTap(item) } }
             )
             .equatable()
@@ -1401,6 +1449,10 @@ extension LaunchpadView {
         return currentItems.indices.contains(globalIndex) ? globalIndex : nil
     }
 
+    /// 拖到格子中间多大范围算「放进文件夹 / 合成文件夹」：和图标一样大，拖着的图标和目标重叠一半以上才算；
+    /// 图标之间留出空隙，停在那里是插到两个图标中间（以前缓存时按 1.6 倍、不缓存按 1.2 倍，大的那个把空隙占满了）
+    private static let centerAreaFactor: CGFloat = 1.0
+
     private func isPointInCenterArea(point: CGPoint,
                                       targetIndex: Int,
                                       containerSize: CGSize,
@@ -1414,7 +1466,7 @@ extension LaunchpadView {
         let now = Date()
         if now.timeIntervalSince(Self.lastGeometryUpdate) < geometryCacheTimeout,
            let cached = Self.geometryCache[cacheKey] {
-            let centerAreaSize = iconSize * 1.6
+            let centerAreaSize = iconSize * Self.centerAreaFactor
             let centerAreaRect = CGRect(
                 x: cached.x - centerAreaSize / 2,
                 y: cached.y - centerAreaSize / 2,
@@ -1425,8 +1477,7 @@ extension LaunchpadView {
         }
         
         let targetCenter = cellCenter(for: targetIndex, in: containerSize, pageIndex: pageIndex, columnWidth: columnWidth, appHeight: appHeight)
-        let scale: CGFloat = 1.2
-        let centerAreaSize = iconSize * scale
+        let centerAreaSize = iconSize * Self.centerAreaFactor
         let centerAreaRect = CGRect(
             x: targetCenter.x - centerAreaSize / 2,
             y: targetCenter.y - centerAreaSize / 2,
@@ -1774,6 +1825,7 @@ extension LaunchpadView {
     private func finalizeDragOperation(containerSize: CGSize, columnWidth: CGFloat, appHeight: CGFloat, iconSize: CGFloat) {
         guard !isSettlingDrop else { return }
         guard let dragging = draggingItem else { return }
+        settlePendingReorder()
         isSettlingDrop = true
         
         // Option 模式：如果没有成功创建/加入文件夹，则撤销放置并回弹
@@ -2044,12 +2096,32 @@ extension LaunchpadView {
         
         dragPreviewPosition = point
         
-        // 性能优化：使用节流机制减少计算频率
+        // 节流：约 60fps 判断一次悬停目标。用自己的计时（以前和几何缓存共用一个时间戳，界面一重画就被刷新，大部分拖动都被跳过）；
+        // 被跳过的那次之后补判一次，保证停下来时按最后的位置判断，不会停在文件夹上却还按路过的格子算
         let now = Date()
-        if now.timeIntervalSince(Self.lastGeometryUpdate) < 0.016 { // 约60fps
+        if now.timeIntervalSince(Self.lastHoverEvaluation) < 0.016 {
+            scheduleTrailingHoverEvaluation(containerSize: containerSize, columnWidth: columnWidth, appHeight: appHeight, iconSize: iconSize)
             return
         }
-        
+        evaluateHover(at: point, containerSize: containerSize, columnWidth: columnWidth, appHeight: appHeight, iconSize: iconSize)
+    }
+
+    private func scheduleTrailingHoverEvaluation(containerSize: CGSize, columnWidth: CGFloat, appHeight: CGFloat, iconSize: CGFloat) {
+        trailingHoverWorkItem?.cancel()
+        let work = DispatchWorkItem {
+            guard draggingItem != nil, !isSettlingDrop else { return }
+            evaluateHover(at: dragPreviewPosition, containerSize: containerSize, columnWidth: columnWidth, appHeight: appHeight, iconSize: iconSize)
+        }
+        trailingHoverWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03, execute: work)
+    }
+
+    /// 按拖拽点判断悬停在哪一格、是合并还是让位，必要时翻页
+    private func evaluateHover(at point: CGPoint, containerSize: CGSize, columnWidth: CGFloat, appHeight: CGFloat, iconSize: CGFloat) {
+        let now = Date()
+        Self.lastHoverEvaluation = now
+        trailingHoverWorkItem?.cancel()
+        trailingHoverWorkItem = nil
         // 异步更新几何缓存时间戳，避免在视图更新期间修改状态
         DispatchQueue.main.async {
             Self.lastGeometryUpdate = now
@@ -2085,6 +2157,7 @@ extension LaunchpadView {
         }
 
         if flipPageIfNeeded(at: point, in: containerSize) {
+            cancelReorder()
             if appStore.isOptionFolderMode {
                 pendingDropIndex = nil
             } else {
@@ -2112,111 +2185,160 @@ extension LaunchpadView {
 
         guard let dragging = draggingItem else { return }
 
+        // 拖着 App 盖到另一个 App / 文件夹的图标上：合成文件夹 / 放进文件夹。
+        // 其余情况（图标之间、空格子、自己原来的位置、拖的是文件夹）都是想放到这一格，停一会儿再让位
         switch hoveringItem {
-        case .app(let targetApp):
-            handleAppHover(dragging: dragging, targetApp: targetApp, hoveringIndex: hoveringIndex, isInCenterArea: isInCenterArea)
-        case .folder(_):
-            handleFolderHover(dragging: dragging, hoveringIndex: hoveringIndex, isInCenterArea: isInCenterArea)
-        case .empty:
-            appStore.isDragCreatingFolder = false
-            appStore.folderCreationTarget = nil
-            pendingDropIndex = hoveringIndex
+        case .app(let targetApp) where isInCenterArea && dragging != .app(targetApp):
+            if case .app = dragging {
+                enterDropTarget(hoveringIndex: hoveringIndex, creatingFolderWith: targetApp)
+            } else {
+                leaveDropTarget()
+                requestReorder(to: hoveringIndex)
+            }
+        case .folder where isInCenterArea:
+            if case .app = dragging {
+                enterDropTarget(hoveringIndex: hoveringIndex, creatingFolderWith: nil)
+            } else {
+                leaveDropTarget()
+                requestReorder(to: hoveringIndex)
+            }
+        default:
+            leaveDropTarget()
+            requestReorder(to: hoveringIndex)
         }
     }
-    
-    private func handleAppHover(dragging: LaunchpadItem, targetApp: AppInfo, hoveringIndex: Int, isInCenterArea: Bool) {
-        if dragging == .app(targetApp) {
-            // Hovering over ourselves due to reorder shifting the dragged item into this slot.
-            // Look up the ORIGINAL item at this grid position so folder creation still works.
-            let sourceItems = dragSourceItems ?? appStore.items
-            if sourceItems.indices.contains(hoveringIndex),
-               case .app(let originalApp) = sourceItems[hoveringIndex],
-               originalApp.id != targetApp.id {
-                handleAppToAppHover(hoveringIndex: hoveringIndex, isInCenterArea: isInCenterArea, targetApp: originalApp)
-            } else {
-                clearHoveringState()
-                pendingDropIndex = hoveringIndex
+
+    /// 拖着的 App 盖到另一个 App / 文件夹的图标上：亮托板，松手就合成文件夹 / 放进文件夹（targetApp 为 nil 时是文件夹）。
+    /// 这时不让位、已经让开的也保持不动，目标不会被挤走；停在文件夹上够久就打开它
+    private func enterDropTarget(hoveringIndex: Int, creatingFolderWith targetApp: AppInfo?) {
+        cancelReorder()
+        if folderHoverCandidateIndex != hoveringIndex {
+            cancelSpringLoad()
+            folderHoverCandidateIndex = hoveringIndex
+            folderHoverBeganAt = Date()
+            if targetApp == nil, case .app(let app) = draggingItem,
+               case .folder(let folder) = currentItems[hoveringIndex] {
+                scheduleSpringLoad(folder: folder, app: app, hoveringIndex: hoveringIndex)
             }
-        } else if case .app = dragging {
-            handleAppToAppHover(hoveringIndex: hoveringIndex, isInCenterArea: isInCenterArea, targetApp: targetApp)
-        } else {
-            clearHoveringState()
-            pendingDropIndex = hoveringIndex
         }
+        if !appStore.isDragCreatingFolder { appStore.isDragCreatingFolder = true }
+        if appStore.folderCreationTarget != targetApp { appStore.folderCreationTarget = targetApp }
     }
-    
-    private func handleAppToAppHover(hoveringIndex: Int, isInCenterArea: Bool, targetApp: AppInfo) {
-        let now = Date()
-        let candidateChanged = folderHoverCandidateIndex != hoveringIndex || !isInCenterArea
-        
-        if candidateChanged {
-            folderHoverCandidateIndex = isInCenterArea ? hoveringIndex : nil
-            folderHoverBeganAt = isInCenterArea ? now : nil
-            appStore.isDragCreatingFolder = false
-            appStore.folderCreationTarget = nil
-        }
-        
-        if isInCenterArea {
-            appStore.isDragCreatingFolder = true
-            appStore.folderCreationTarget = targetApp
-            pendingDropIndex = nil
-        } else {
-            if !isInCenterArea || folderHoverCandidateIndex == nil {
-                appStore.isDragCreatingFolder = false
-                appStore.folderCreationTarget = nil
-                pendingDropIndex = hoveringIndex
-            } else {
-                pendingDropIndex = nil
-            }
-        }
+
+    /// 离开了图标（到了图标之间、空格子上）：撤掉托板
+    private func leaveDropTarget() {
+        cancelSpringLoad()
+        folderHoverCandidateIndex = nil
+        folderHoverBeganAt = nil
+        if appStore.isDragCreatingFolder { appStore.isDragCreatingFolder = false }
+        if appStore.folderCreationTarget != nil { appStore.folderCreationTarget = nil }
     }
-    
-    private func handleFolderHover(dragging: LaunchpadItem, hoveringIndex: Int, isInCenterArea: Bool) {
-        if case .app = dragging {
-            let now = Date()
-            let candidateChanged = folderHoverCandidateIndex != hoveringIndex || !isInCenterArea
-            
-            if candidateChanged {
-                folderHoverCandidateIndex = isInCenterArea ? hoveringIndex : nil
-                folderHoverBeganAt = isInCenterArea ? now : nil
-                appStore.isDragCreatingFolder = false
-                appStore.folderCreationTarget = nil
-            }
-            
-            if isInCenterArea {
-                appStore.isDragCreatingFolder = true
-                appStore.folderCreationTarget = nil
-                pendingDropIndex = nil
-            } else {
-                if !isInCenterArea || folderHoverCandidateIndex == nil {
-                    appStore.isDragCreatingFolder = false
-                    appStore.folderCreationTarget = nil
-                    pendingDropIndex = hoveringIndex
-                } else {
-                    pendingDropIndex = nil
-                }
-            }
-        } else {
-            clearHoveringState()
-            pendingDropIndex = hoveringIndex
+
+    /// 停在图标之间多久两边才让开。只是路过（比如正往文件夹上拖）不让位，免得要放进去的文件夹被挤走
+    private static let reorderDwell: TimeInterval = 0.25
+
+    /// 想放到第 index 格：停够 reorderDwell 才让位（index 是现在显示的排列里的位置）
+    private func requestReorder(to index: Int) {
+        if pendingDropIndex == index {
+            cancelReorder()
+            return
         }
+        guard reorderCandidateIndex != index else { return }
+        cancelReorder()
+        reorderCandidateIndex = index
+        let work = DispatchWorkItem {
+            guard reorderCandidateIndex == index, draggingItem != nil, !isSettlingDrop,
+                  !appStore.isOptionFolderMode else { return }
+            reorderWorkItem = nil
+            reorderCandidateIndex = nil
+            pendingDropIndex = index
+        }
+        reorderWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.reorderDwell, execute: work)
+    }
+
+    private func cancelReorder() {
+        reorderWorkItem?.cancel()
+        reorderWorkItem = nil
+        reorderCandidateIndex = nil
+    }
+
+    /// 松手时还在等让位：不在图标上就直接按等的那个位置放（不用等它让开）
+    private func settlePendingReorder() {
+        if !appStore.isDragCreatingFolder, !appStore.isOptionFolderMode, let candidate = reorderCandidateIndex {
+            pendingDropIndex = candidate
+        }
+        cancelReorder()
     }
     
     private func clearHoveringState() {
+        cancelSpringLoad()
+        cancelReorder()
         appStore.isDragCreatingFolder = false
         appStore.folderCreationTarget = nil
         pendingDropIndex = nil
         folderHoverCandidateIndex = nil
         folderHoverBeganAt = nil
     }
+
+    /// 拖着 App 在文件夹上停多久自动打开它（像 iOS）
+    private static let springLoadDelay: TimeInterval = 0.7
+
+    private func scheduleSpringLoad(folder: FolderInfo, app: AppInfo, hoveringIndex: Int) {
+        let began = folderHoverBeganAt
+        let work = DispatchWorkItem {
+            // 到点时还停在同一个文件夹上、还按着鼠标才打开
+            guard springLoadWorkItem != nil, folderHoverBeganAt == began,
+                  folderHoverCandidateIndex == hoveringIndex, appStore.folderCreationTarget == nil,
+                  draggingItem == .app(app), !isSettlingDrop, !isFolderOpen,
+                  NSEvent.pressedMouseButtons & 1 != 0,
+                  currentItems.indices.contains(hoveringIndex),
+                  case .folder(let current) = currentItems[hoveringIndex], current.id == folder.id else { return }
+            springLoadWorkItem = nil
+            springOpenFolder(folder, with: app)
+        }
+        springLoadWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.springLoadDelay, execute: work)
+    }
+
+    private func cancelSpringLoad() {
+        springLoadWorkItem?.cancel()
+        springLoadWorkItem = nil
+    }
+
+    /// 打开文件夹并把 App 先放进去，拖拽交给文件夹接着拖：松手放在指着的位置，拖出文件夹就交还主界面（FolderView 里的交接逻辑）
+    private func springOpenFolder(_ folder: FolderInfo, with app: AppInfo) {
+        // 这次按下（在主界面的图标上）接下来交给文件夹，主界面的按钮手势不该再跟踪它
+        NSApp.keyWindow?.contentView?.cancelActiveGestureRecognizers()
+        // 从别的文件夹拖出来的接力拖拽：撤掉它的监听，不然它会继续吞掉拖动和抬起，新打开的文件夹收不到
+        if let monitor = handoffEventMonitor {
+            NSEvent.removeMonitor(monitor)
+            handoffEventMonitor = nil
+        }
+        appStore.springLoadedApp = app
+        appStore.addAppToFolder(app, folder: folder)
+        // 主界面这边的拖拽到此为止，不走放下的逻辑
+        draggingItem = nil
+        dragSourceItems = nil
+        dragOriginalIndex = nil
+        clearHoveringState()
+        resetDragPagingState()
+        let opened = appStore.folders.first { $0.id == folder.id } ?? folder
+        withAnimation(LNAnimations.folder) {
+            appStore.openFolder = opened
+        }
+    }
 }
 
 
 struct GridConfig {
     let isFullscreen: Bool
-    
-    init(isFullscreen: Bool = false) {
+    /// 「整体大小」的缩放比例（全屏模式为 1）
+    let scale: CGFloat
+
+    init(isFullscreen: Bool = false, scale: CGFloat = 1) {
         self.isFullscreen = isFullscreen
+        self.scale = scale
     }
     
     var itemsPerPage: Int { 35 }
@@ -2227,7 +2349,7 @@ struct GridConfig {
     let pageSpacing: CGFloat = 100
     // 窗口模式行距为 0：每格高度已含名字和上下留白（见 iconSide），整页正好铺满
     var rowSpacing: CGFloat { isFullscreen ? 16 : 0 }
-    let columnSpacing: CGFloat = 24
+    var columnSpacing: CGFloat { 24 * scale }
     // 窗口模式下网格四周的留白，随窗口大小等比放大（全屏模式用下面按比例的 padding）。
     // 默认窗口（约 980×840）下：左右 34、下 25、分隔线下 25
     func windowedHorizontalInset(for size: CGSize) -> CGFloat {
@@ -2263,11 +2385,29 @@ struct GridConfig {
 
 //
 
+/// 拖着的 App 停在另一个 App / 文件夹上时，目标图标后面那块亮托板（比图标大一圈，从四周露出来）
+struct DropTargetPlate: View {
+    let iconSize: CGFloat
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: iconSize * 0.32, style: .continuous)
+            .fill(Color.white.opacity(0.32))
+            .overlay(
+                RoundedRectangle(cornerRadius: iconSize * 0.32, style: .continuous)
+                    .stroke(Color.white.opacity(0.75), lineWidth: 2)
+            )
+            .frame(width: iconSize * 1.4, height: iconSize * 1.4)
+            .shadow(color: .black.opacity(0.18), radius: 8, y: 2)
+    }
+}
+
 struct DragPreviewItem: View {
     let item: LaunchpadItem
     let iconSize: CGFloat
     let labelWidth: CGFloat
     var scale: CGFloat = 1.2
+    /// 「整体大小」的缩放比例
+    var layoutScale: CGFloat = 1
     @Environment(\.displayScale) private var displayScale
 
     // 性能优化：使用计算属性避免状态修改
@@ -2285,22 +2425,22 @@ struct DragPreviewItem: View {
     var body: some View {
         switch item {
         case .app(let app):
-            VStack(spacing: 6) {
+            VStack(spacing: 6 * layoutScale) {
                 Image(nsImage: displayIcon)
                     .resizable()
                     .interpolation(.high)
                     .antialiased(true)
                     .frame(width: iconSize, height: iconSize)
-                AppNameLabel(name: app.name, width: labelWidth)
+                AppNameLabel(name: app.name, width: labelWidth, fontScale: AppStore.textScale(for: layoutScale))
                     .foregroundColor(.primary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
+                    .padding(.horizontal, 8 * layoutScale)
+                    .padding(.vertical, 4 * layoutScale)
             }
             .scaleEffect(scale)
             .animation(LNAnimations.easeInOut, value: scale)
 
         case .folder(let folder):
-            VStack(spacing: 6) {
+            VStack(spacing: 6 * layoutScale) {
                 ZStack {
                     RoundedRectangle(cornerRadius: iconSize * 0.2)
                         .foregroundStyle(Color.clear)
@@ -2318,10 +2458,10 @@ struct DragPreviewItem: View {
                         .frame(width: iconSize, height: iconSize)
                 }
                 
-                AppNameLabel(name: folder.name, width: labelWidth)
+                AppNameLabel(name: folder.name, width: labelWidth, fontScale: AppStore.textScale(for: layoutScale))
                     .foregroundColor(.primary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
+                    .padding(.horizontal, 8 * layoutScale)
+                    .padding(.vertical, 4 * layoutScale)
             }
             .scaleEffect(scale)
             .animation(LNAnimations.easeInOut, value: scale)

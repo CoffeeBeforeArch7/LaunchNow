@@ -41,6 +41,8 @@ struct FolderView: View {
     @State private var scrollOffsetY: CGFloat = 0
     @State private var outOfBoundsBeganAt: Date? = nil
     @State private var hasHandedOffDrag: Bool = false
+    /// 停留打开的文件夹：打开时鼠标可能还在文件夹外面，先不算拖出去，等鼠标进来过一次再按出界交还主界面
+    @State private var springLoadedGrace: Bool = false
     @State private var lastDroppedAppID: String? = nil
     @State private var isScrolling: Bool = false
     @State private var lastScrollMark: Date = .distantPast
@@ -62,12 +64,13 @@ struct FolderView: View {
     let onClose: () -> Void
     let onLaunchApp: (AppInfo) -> Void
     
-    // 优化间距和布局参数
-    private let spacing: CGFloat = 30
+    // 优化间距和布局参数（都乘「整体大小」的缩放比例）
+    private var layoutScale: CGFloat { appStore.layoutScale }
+    private var spacing: CGFloat { 30 * layoutScale }
     // 动态列数，根据窗口宽度与单元最小宽度自适应
     @State private var columnsCount: Int = 4
-    private let gridPadding: CGFloat = 16
-    private let titlePadding: CGFloat = 16
+    private var gridPadding: CGFloat { 16 * layoutScale }
+    private var titlePadding: CGFloat { 16 * layoutScale }
 
     private var visualApps: [AppInfo] {
         visualAppSlots.compactMap {
@@ -115,10 +118,10 @@ struct FolderView: View {
                 }
             }
         }
-        .padding(.horizontal)
+        .padding(.horizontal, 16 * layoutScale)
         .background {
-            Color.clear.background(.ultraThinMaterial.opacity(appStore.materialOpacity), in: RoundedRectangle(cornerRadius: 30)).shadow(radius: 15)
-            Color.clear.glassEffect(.clear, in: RoundedRectangle(cornerRadius: 30))
+            Color.clear.background(.ultraThinMaterial.opacity(appStore.materialOpacity), in: RoundedRectangle(cornerRadius: 30 * layoutScale)).shadow(radius: 15)
+            Color.clear.glassEffect(.clear, in: RoundedRectangle(cornerRadius: 30 * layoutScale))
         }
         .onTapGesture {
             // 当点击文件夹视图的非编辑区域时，如果正在编辑名称，则退出编辑模式
@@ -173,15 +176,15 @@ struct FolderView: View {
     private var folderTitleSection: some View {
         HStack {
             Spacer()
-            VStack(spacing: 8) {
+            VStack(spacing: 8 * layoutScale) {
                 if isEditingName {
                     TextField(NSLocalizedString("FolderName", comment: "Folder Name"), text: $folderName)
                         .textFieldStyle(.plain)
                         .multilineTextAlignment(.center)
-                        .font(.title)
+                        .font(.system(size: 22 * layoutScale))
                         .foregroundColor(.primary)
                         .focused($isTextFieldFocused)
-                        .padding()
+                        .padding(16 * layoutScale)
                         .onSubmit {
                             finishEditing()
                         }
@@ -193,9 +196,9 @@ struct FolderView: View {
                         }
                 } else {
                     Text(folder.name)
-                        .font(.title)
+                        .font(.system(size: 22 * layoutScale))
                         .foregroundColor(.primary)
-                        .padding()
+                        .padding(16 * layoutScale)
                         .contentShape(Rectangle()) // 确保整个区域都可以点击
                         .onTapGesture(count: 2) {
                             startEditing()
@@ -225,7 +228,7 @@ struct FolderView: View {
         let recomputedAppHeight = computeAppHeight(containerHeight: geo.size.height, columns: desiredColumns)
         // 保障单元格至少能容纳传入的图标尺寸与标签区域
         let columnWidth = max(recomputedColumnWidth, iconSize)
-        let appHeight = max(recomputedAppHeight, iconSize + 32)
+        let appHeight = max(recomputedAppHeight, iconSize + 32 * layoutScale)
         let labelWidth: CGFloat = columnWidth
         let slots = visualAppSlots
 
@@ -280,7 +283,8 @@ struct FolderView: View {
                 DragPreviewItem(item: .app(draggingApp),
                                 iconSize: iconSize,
                                 labelWidth: labelWidth,
-                                scale: dragPreviewScale)
+                                scale: dragPreviewScale,
+                                layoutScale: layoutScale)
                     .position(x: dragPreviewPosition.x, y: dragPreviewPosition.y)
                     .opacity(dragPreviewOpacity)
                     .zIndex(100)
@@ -300,6 +304,7 @@ struct FolderView: View {
                         folderCurrentColumnWidth = columnWidth
                         folderCurrentAppHeight = appHeight
                         folderCurrentIconSize = iconSize
+                        DispatchQueue.main.async { startSpringLoadedDragIfNeeded() }
                     }
                     .onChange(of: geo.size) { _, _ in
                         folderCurrentContainerSize = geo.size
@@ -359,14 +364,14 @@ extension FolderView {
         let maxRowsPerPage = Int(ceil(Double(folder.apps.count) / Double(max(columns, 1))))
         let totalRowSpacing = spacing * CGFloat(max(0, maxRowsPerPage - 1))
         let height = (containerHeight - totalRowSpacing) / CGFloat(maxRowsPerPage == 0 ? 1 : maxRowsPerPage)
-        return max(60, min(120, height)) // 优化高度范围
+        return max(60 * layoutScale, min(120 * layoutScale, height)) // 优化高度范围
     }
     
     private func computeColumnWidth(containerWidth: CGFloat, columns: Int) -> CGFloat {
         let cols = max(columns, 1)
         let totalColumnSpacing = spacing * CGFloat(max(0, cols - 1))
         let width = (containerWidth - totalColumnSpacing) / CGFloat(cols)
-        return max(50, width) // 优化最小宽度
+        return max(50 * layoutScale, width) // 优化最小宽度
     }
 
     // 拖拽命中与单元格几何计算（在下方扩展中实现）
@@ -388,6 +393,7 @@ extension FolderView {
             isSelected: isSelected,
             showAppNameBelowIcon: appStore.showAppNameBelowIcon,
             shouldAllowHover: draggingApp == nil,
+            scale: layoutScale,
             onTap: {
                 // 在编辑状态下不启动应用
                 if draggingApp == nil && !isEditingName {
@@ -421,6 +427,15 @@ extension FolderView {
         folderDragEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]) { event in
             switch event.type {
             case .leftMouseDown:
+                // 上一次拖拽没收到抬起（被别的监听吞了）：新的按下说明早就松手了，先清掉，免得之后的拖拽都被挡住
+                if draggingApp != nil, !isSettlingDrop {
+                    draggingApp = nil
+                    dragSourceApps = nil
+                    pendingDropIndex = nil
+                    isDraggingActive = false
+                    springLoadedGrace = false
+                    dragPreviewOpacity = 1.0
+                }
                 guard !isEditingName, draggingApp == nil else { return event }
                 refreshScrollOffset()
                 let localPoint = convertWindowToFolderGrid(event.locationInWindow)
@@ -466,8 +481,9 @@ extension FolderView {
                     let isOutside = localPoint.x < 0 || localPoint.y < 0 ||
                                     localPoint.x > folderCurrentContainerSize.width ||
                                     localPoint.y > folderCurrentContainerSize.height
+                    if springLoadedGrace && !isOutside { springLoadedGrace = false }
                     let now = Date()
-                    if isOutside {
+                    if isOutside && !springLoadedGrace {
                         if outOfBoundsBeganAt == nil { outOfBoundsBeganAt = now }
                         if !hasHandedOffDrag, let start = outOfBoundsBeganAt, now.timeIntervalSince(start) >= outOfBoundsDwell {
                             hasHandedOffDrag = true
@@ -525,7 +541,10 @@ extension FolderView {
             case .leftMouseUp:
                 isDraggingActive = false
                 folderDragMouseDownApp = nil
+                springLoadedGrace = false
                 guard !isEditingName, let dragging = draggingApp else { return event }
+                // 下面都会吞掉这次抬起：先取消还在跟踪这次按下的按钮手势（停留打开时，按下是在主界面的图标上）
+                event.window?.contentView?.cancelActiveGestureRecognizers()
                 isSettlingDrop = true
                 defer {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
@@ -578,6 +597,28 @@ extension FolderView {
                 return event
             }
         }
+    }
+
+    /// 主界面拖着 App 在文件夹上停留打开了这个文件夹：App 已经放进来了，接着在这里拖它
+    private func startSpringLoadedDragIfNeeded() {
+        guard let app = appStore.springLoadedApp else { return }
+        appStore.springLoadedApp = nil
+        // 文件夹打开的动画里就松手了：App 已经在文件夹里，不用再拖
+        guard NSEvent.pressedMouseButtons & 1 != 0, draggingApp == nil, folder.apps.contains(app) else { return }
+        var tx = Transaction(); tx.disablesAnimations = true
+        withTransaction(tx) {
+            draggingApp = app
+            dragSourceApps = folder.apps
+            dragPreviewOpacity = 1.0
+            dragPreviewScale = 1.2
+            isSettlingDrop = false
+        }
+        isDraggingActive = true
+        isKeyboardNavigationActive = false
+        springLoadedGrace = true
+        outOfBoundsBeganAt = nil
+        hasHandedOffDrag = false
+        dragPreviewPosition = convertScreenToFolderGrid(NSEvent.mouseLocation)
     }
 
     private func convertScreenToFolderGrid(_ screenPoint: CGPoint) -> CGPoint {

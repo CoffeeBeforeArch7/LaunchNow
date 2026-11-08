@@ -60,7 +60,32 @@ final class AppStore: ObservableObject {
         }
     }
     
-    @Published var referenceContentSize: CGSize = .zero
+    /// 「整体大小」（设置里的滑块）：窗口模式下面板高 = 840 × 它，宽按 7:6，范围 0.6–1.0，默认 1。
+    /// 只有滑块和拖窗口边缘会改它；屏幕放不下时窗口只是临时缩小，这个值不变
+    @Published var panelScale: Double = 1.0 {
+        didSet {
+            UserDefaults.standard.set(panelScale, forKey: "panelScale")
+            if panelScale != oldValue {
+                AppDelegate.shared?.applyPanelScale()
+            }
+        }
+    }
+
+    static let panelScaleRange: ClosedRange<Double> = 0.6...1.0
+
+    static func clampedPanelScale(_ scale: Double) -> Double {
+        min(max(scale, panelScaleRange.lowerBound), panelScaleRange.upperBound)
+    }
+
+    /// 窗口模式下面板实际的缩放比例 = 窗口高度 / 840，全屏模式为 1（屏幕放不下时可能比「整体大小」小）。
+    /// 字号、间距、圆角都乘它，图标随格子大小自动变；由 AppDelegate 按窗口实际大小算出
+    @Published var layoutScale: CGFloat = 1
+
+    /// 设置面板最多能多高（从窗口顶边到程序坞上面），放不下就滚动；由 AppDelegate 在窗口、屏幕变化时更新
+    @Published var settingsMaxHeight: CGFloat = 800
+
+    /// 名字等小字跟着缩，但最小按 0.85 算（13pt 的名字不小于 11pt），再小就看不清
+    static func textScale(for layoutScale: CGFloat) -> CGFloat { max(layoutScale, 0.85) }
 
     private let hiddenAppsDefaultsKey = "hiddenApplicationPaths"
     @Published var hiddenAppPaths: Set<String> = [] {
@@ -107,6 +132,8 @@ final class AppStore: ObservableObject {
     @Published var isFolderNameEditing: Bool = false
     @Published var handoffDraggingApp: AppInfo? = nil
     @Published var handoffDragScreenLocation: CGPoint? = nil
+    /// 主界面拖着 App 在文件夹上停留、文件夹自动打开后，交给文件夹接着拖的那个 App（已经放进文件夹了）
+    @Published var springLoadedApp: AppInfo? = nil
     
     // 触发器
     @Published var folderUpdateTrigger: UUID = UUID()
@@ -135,8 +162,8 @@ final class AppStore: ObservableObject {
     private let fsEventsQueue = DispatchQueue(label: "app.store.fsevents")
     private let fsEventsStateLock = NSLock()
     private let searchIndexLock = NSLock()
-    private var appNameIndex: [String: String] = [:]
-    private var folderNameIndex: [String: String] = [:]
+    private var appNameIndex: [String: SearchKey] = [:]
+    private var folderNameIndex: [String: SearchKey] = [:]
     
     // 计算属性
     private var itemsPerPage: Int { 35 }
@@ -271,14 +298,12 @@ final class AppStore: ObservableObject {
             byPath[path] = appInfo(from: url)
         }
         let allApps = Array(byPath.values)
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let filtered: [AppInfo]
-        if query.isEmpty {
-            filtered = allApps
+        if let query = SearchQuery(searchText) {
+            // 和主界面一样认拼音；路径也能搜
+            filtered = allApps.filter { SearchKey(name: $0.name, aliases: [$0.url.path] + Self.wrappedAppNames(for: $0.url)).matches(query) }
         } else {
-            filtered = allApps.filter { app in
-                app.name.lowercased().contains(query) || app.url.path.lowercased().contains(query)
-            }
+            filtered = allApps
         }
         return filtered.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
@@ -295,6 +320,9 @@ final class AppStore: ObservableObject {
             self.iconScale = savedIconScale
         } else {
             self.iconScale = 1.0
+        }
+        if let savedPanelScale = UserDefaults.standard.object(forKey: "panelScale") as? Double, savedPanelScale > 0 {
+            self.panelScale = Self.clampedPanelScale(savedPanelScale)
         }
         self.showAppNameBelowIcon = UserDefaults.standard.object(forKey: "showAppNameBelowIcon") as? Bool ?? true
         self.isGlobalPinchEnabled = UserDefaults.standard.bool(forKey: "isGlobalPinchEnabled")
@@ -1156,23 +1184,27 @@ final class AppStore: ObservableObject {
     }
     
     // MARK: - Search index & filtered items
+    /// 搜索索引：显示名、.app 文件名（微信也能搜 wechat）、iPhone/iPad App 包里的中文名，以及它们的拼音（见 PinyinSearch）
     private func updateSearchIndex(apps: [AppInfo], folders: [FolderInfo]) {
-        var appIndex: [String: String] = [:]
+        func key(for app: AppInfo) -> SearchKey {
+            SearchKey(name: app.name, aliases: [app.url.deletingPathExtension().lastPathComponent] + Self.wrappedAppNames(for: app.url))
+        }
+        var appIndex: [String: SearchKey] = [:]
         appIndex.reserveCapacity(apps.count + folders.reduce(0) { $0 + $1.apps.count })
         for app in apps {
-            appIndex[app.url.path] = app.name.lowercased()
+            appIndex[app.url.path] = key(for: app)
         }
         for folder in folders {
             for app in folder.apps {
                 if appIndex[app.url.path] == nil {
-                    appIndex[app.url.path] = app.name.lowercased()
+                    appIndex[app.url.path] = key(for: app)
                 }
             }
         }
-        var folderIndex: [String: String] = [:]
+        var folderIndex: [String: SearchKey] = [:]
         folderIndex.reserveCapacity(folders.count)
         for folder in folders {
-            folderIndex[folder.id] = folder.name.lowercased()
+            folderIndex[folder.id] = SearchKey(name: folder.name)
         }
         searchIndexLock.lock()
         appNameIndex = appIndex
@@ -1180,9 +1212,30 @@ final class AppStore: ObservableObject {
         searchIndexLock.unlock()
     }
     
+    private static let wrappedNamesLock = NSLock()
+    private static var wrappedNamesCache: [String: [String]] = [:]
+
+    /// iPhone/iPad App（rednote.app 里是 WrappedBundle → Wrapper/discover.app）：系统给的名字是商店里的英文名，
+    /// 包里自带按语言的名字（小红书），拿来当搜索别名。按路径记住结果，不用每次搜索都读包
+    static func wrappedAppNames(for url: URL) -> [String] {
+        wrappedNamesLock.lock()
+        defer { wrappedNamesLock.unlock() }
+        if let cached = wrappedNamesCache[url.path] { return cached }
+        var names: [String] = []
+        let link = url.appendingPathComponent("WrappedBundle")
+        if (try? link.checkResourceIsReachable()) == true, let inner = Bundle(url: link.resolvingSymlinksInPath()) {
+            for dict in [inner.localizedInfoDictionary, inner.infoDictionary] {
+                if let name = dict?["CFBundleDisplayName"] as? String, !name.isEmpty, !names.contains(name) {
+                    names.append(name)
+                }
+            }
+        }
+        wrappedNamesCache[url.path] = names
+        return names
+    }
+
     private func rebuildFilteredItems(items: [LaunchpadItem], searchText: String) {
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if query.isEmpty {
+        guard let query = SearchQuery(searchText) else {
             applyFilteredItems(items)
             return
         }
@@ -1200,18 +1253,18 @@ final class AppStore: ObservableObject {
             switch item {
             case .app(let app):
                 if !isAppHidden(path: app.url.path),
-                   let name = appIndex[app.url.path], name.contains(query) {
+                   let key = appIndex[app.url.path], key.matches(query) {
                     result.append(.app(app))
                     searchedApps.insert(app.url.path)
                 }
             case .folder(let folder):
-                if let name = folderIndex[folder.id], name.contains(query) {
+                if let key = folderIndex[folder.id], key.matches(query) {
                     result.append(.folder(folder))
                 }
                 for app in folder.apps {
                     if searchedApps.contains(app.url.path) { continue }
                     if !isAppHidden(path: app.url.path),
-                       let name = appIndex[app.url.path], name.contains(query) {
+                       let key = appIndex[app.url.path], key.matches(query) {
                         result.append(.app(app))
                         searchedApps.insert(app.url.path)
                     }

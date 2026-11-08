@@ -11,6 +11,8 @@ struct LaunchpadItemButton: View {
     let showAppNameBelowIcon: Bool
     var shouldAllowHover: Bool = true
     var externalScale: CGFloat? = nil
+    /// 「整体大小」的缩放比例：间距、名字字号跟着缩（图标边长由外面按格子算好）
+    var scale: CGFloat = 1
     let onTap: () -> Void
     let onDoubleClick: (() -> Void)?
     
@@ -51,6 +53,7 @@ struct LaunchpadItemButton: View {
         showAppNameBelowIcon: Bool = true,
         shouldAllowHover: Bool = true,
         externalScale: CGFloat? = nil,
+        scale: CGFloat = 1,
         onTap: @escaping () -> Void,
         onDoubleClick: (() -> Void)? = nil) {
             self.item = item
@@ -60,6 +63,7 @@ struct LaunchpadItemButton: View {
             self.showAppNameBelowIcon = showAppNameBelowIcon
             self.shouldAllowHover = shouldAllowHover
             self.externalScale = externalScale
+            self.scale = scale
             self.onTap = onTap
             self.onDoubleClick = onDoubleClick
         }
@@ -68,7 +72,7 @@ struct LaunchpadItemButton: View {
         _ = folderIconRefreshToken
         let renderedIcon = resolveIcon()
         return Button(action: handleTap) {
-            VStack(spacing: 8) {
+            VStack(spacing: 8 * scale) {
                 ZStack {
                     if isFolderIcon {   
                         RoundedRectangle(cornerRadius: iconSize * 0.2)
@@ -93,14 +97,14 @@ struct LaunchpadItemButton: View {
                 .animation(LNAnimations.easeInOut, value: isHovered || isSelected)
 
                 if showAppNameBelowIcon {
-                    AppNameLabel(name: item.name, width: labelWidth)
+                    AppNameLabel(name: item.name, width: labelWidth, fontScale: AppStore.textScale(for: scale))
                         .foregroundStyle(.primary)
                         .shadow(color: .black.opacity(0.25), radius: 1, y: 0.5)
                 }
             }
         }
         .buttonStyle(.plain)
-        .padding(8)
+        .padding(8 * scale)
         .onHover { hovering in
             if shouldAllowHover {
                 isHovered = hovering
@@ -171,7 +175,8 @@ extension LaunchpadItemButton: Equatable {
         lhs.isSelected == rhs.isSelected &&
         lhs.showAppNameBelowIcon == rhs.showAppNameBelowIcon &&
         lhs.shouldAllowHover == rhs.shouldAllowHover &&
-        lhs.externalScale == rhs.externalScale
+        lhs.externalScale == rhs.externalScale &&
+        lhs.scale == rhs.scale
     }
 }
 
@@ -180,10 +185,12 @@ extension LaunchpadItemButton: Equatable {
 struct AppNameLabel: View {
     let name: String
     let width: CGFloat
+    /// 字号缩放（「整体大小」，最小 0.85，见 AppStore.textScale）
+    var fontScale: CGFloat = 1
 
     var body: some View {
         Text(name)
-            .font(.system(size: 13, weight: .medium))
+            .font(.system(size: 13 * fontScale, weight: .medium))
             .lineLimit(1)
             .minimumScaleFactor(0.65)
             .allowsTightening(true)
