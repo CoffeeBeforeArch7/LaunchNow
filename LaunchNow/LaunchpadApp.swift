@@ -81,6 +81,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // 先套用自选图标，再扫描 App：重新安装会冲掉自选图标，晚了的话缓存里存的是默认的火箭
         AppIconChoice.reapplyIfCustom()
         Self.shared = self
+        // 搜索框一拿到焦点，系统就在光标旁弹出输入法指示器（「ABC」小气泡）。它由另一个进程画，
+        // 和面板同步时常超时，一次超时画面停 0.5 秒，刚打开时常连着好几次。只对 LaunchNow 关掉，别的 App 照旧
+        UserDefaults.standard.set(false, forKey: "TSMLanguageIndicatorEnabled")
 
         migrateWindowLayoutIfNeeded()
         setupWindow()
@@ -322,7 +325,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         appStore.searchText = ""
         appStore.openFolder = nil
         appStore.saveAllOrder()
-        appStore.refresh()
+        appStore.tidyUpAfterHide()
         NotificationCenter.default.post(name: .launchpadWindowHidden, object: nil)
     }
 

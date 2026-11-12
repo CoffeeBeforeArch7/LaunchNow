@@ -2394,6 +2394,17 @@ final class AppStore: ObservableObject {
         removeEmptyPages()
     }
     
+    /// 收起面板后的收尾：清掉拖拽留下的空文件夹，把空位挪到每页末尾，删掉空页，再存一次布局。
+    /// 不像 refresh() 那样清图标缓存、重新扫描（装、删、更新 App 由 FSEvents 自动重扫，见 startAutoRescan）：
+    /// 每次收起都重扫的话，图标全换成新对象，下次打开时每个图标都要在主线程上重画一遍，打开那一下就卡
+    func tidyUpAfterHide() {
+        pruneEmptyFolders()
+        // 从文件夹往外拖的途中不补位（见 removeAppFromFolder），收起时补一次，免得页面中间留空格
+        compactItemsWithinPages()
+        removeEmptyPages()
+        saveAllOrder()
+    }
+
     /// 清除缓存
     func clearCache() {
         cacheManager.clearAllCaches()
